@@ -15,6 +15,13 @@
       "when": 1784383132422,
       "tag": "0001_complete_silver_centurion",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1784385296210,
+      "tag": "0002_sharp_hiroim",
+      "breakpoints": true
     }
   ]
 }

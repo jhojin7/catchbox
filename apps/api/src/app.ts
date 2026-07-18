@@ -3,12 +3,14 @@ import { basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { CatchboxConfig } from "@catchbox/config";
 import {
-  authenticateBrowserSession,
+  authenticateCredential,
+  changeLocalAccountPassword,
   countLocalAccounts,
-  createBrowserSession,
+  createCredential,
   getDatabaseHealth,
   InvalidCaptureCursorError,
   listTextCaptures,
+  revokeCredential,
   saveTextCaptureBatch,
   verifyLocalAccountPassword,
   type CatchboxDatabase,
@@ -18,14 +20,24 @@ import {
   captureBatchResponseSchema,
   captureListQuerySchema,
   captureListResponseSchema,
+  changePasswordRequestSchema,
   currentAccountSchema,
   errorEnvelopeSchema,
   healthResponseSchema,
   loginRequestSchema,
+  sessionClientKinds,
+  tokenLoginResponseSchema,
+  type CurrentAccount,
   type ErrorEnvelope,
   type HealthResponse,
+  type SessionClientKind,
 } from "@catchbox/shared";
-import express, { type Request, type Response } from "express";
+import express, {
+  type CookieOptions,
+  type NextFunction,
+  type Request,
+  type Response,
+} from "express";
 
 const SESSION_COOKIE = "catchbox_session";
 const defaultWebDistPath = fileURLToPath(new URL("../../web/dist", import.meta.url));
@@ -41,6 +53,13 @@ interface AppDependencies {
   config: CatchboxConfig;
   logger: StructuredLogger;
   webDistPath?: string;
+  clock?: () => Date;
+}
+
+interface AuthenticatedRequest {
+  account: CurrentAccount;
+  credential: { id: string; clientKind: SessionClientKind };
+  source: "cookie" | "bearer";
 }
 
 interface ResponseSchema<Output> {
@@ -66,7 +85,7 @@ function healthResponse(response: Response, status: number, health: HealthRespon
 
 function currentAccountResponse(
   response: Response,
-  account: { id: string; username: string },
+  account: CurrentAccount,
 ) {
   return validatedJson(response, 200, currentAccountSchema, {
     id: account.id,
@@ -74,11 +93,48 @@ function currentAccountResponse(
   });
 }
 
+function tokenLoginResponse(
+  response: Response,
+  account: CurrentAccount,
+  credential: { token: string; absoluteExpiresAt: Date },
+) {
+  return validatedJson(response, 200, tokenLoginResponseSchema, {
+    account: { id: account.id, username: account.username },
+    token: credential.token,
+    tokenType: "Bearer",
+    expiresAt: credential.absoluteExpiresAt.toISOString(),
+  });
+}
+
 function readCookie(request: Request, name: string) {
   const cookies = request.headers.cookie?.split(";") ?? [];
   const prefix = `${name}=`;
   const value = cookies.map((cookie) => cookie.trim()).find((cookie) => cookie.startsWith(prefix));
-  return value ? decodeURIComponent(value.slice(prefix.length)) : undefined;
+  if (!value) return undefined;
+  try {
+    return decodeURIComponent(value.slice(prefix.length));
+  } catch {
+    return undefined;
+  }
+}
+
+function readBearerToken(request: Request) {
+  const authorization = request.header("authorization");
+  const match = authorization?.match(/^Bearer ([A-Za-z0-9_-]+)$/i);
+  return match?.[1];
+}
+
+function sessionCookieOptions(config: CatchboxConfig): CookieOptions {
+  return {
+    httpOnly: true,
+    sameSite: "strict",
+    secure: config.secureCookies,
+    path: "/",
+  };
+}
+
+function clearSessionCookie(response: Response, config: CatchboxConfig) {
+  response.clearCookie(SESSION_COOKIE, sessionCookieOptions(config));
 }
 
 export function createApp({
@@ -86,6 +142,7 @@ export function createApp({
   config,
   logger,
   webDistPath = defaultWebDistPath,
+  clock = () => new Date(),
 }: AppDependencies) {
   const app = express();
   app.disable("x-powered-by");
@@ -134,48 +191,123 @@ export function createApp({
       });
     }
 
-    const session = createBrowserSession(database, account, {
-      idleSeconds: config.sessionIdleSeconds,
-      absoluteSeconds: config.sessionAbsoluteSeconds,
-    });
-    response.cookie(SESSION_COOKIE, session.token, {
-      httpOnly: true,
-      sameSite: "strict",
-      secure: config.secureCookies,
-      path: "/",
-      expires: session.absoluteExpiresAt,
-    });
+    const clientKind = parsed.data.clientKind ?? sessionClientKinds.browser;
+    const credential = createCredential(
+      database,
+      account,
+      clientKind,
+      {
+        idleSeconds: config.sessionIdleSeconds,
+        absoluteSeconds: config.sessionAbsoluteSeconds,
+      },
+      clock(),
+    );
     response.setHeader("cache-control", "no-store");
-    logger.info({ event: "authentication_success", username: account.username });
+    logger.info({ event: "authentication_success", username: account.username, clientKind });
+
+    if (clientKind !== sessionClientKinds.browser) {
+      return tokenLoginResponse(response, account, credential);
+    }
+
+    response.cookie(SESSION_COOKIE, credential.token, {
+      ...sessionCookieOptions(config),
+      expires: credential.absoluteExpiresAt,
+    });
     return currentAccountResponse(response, account);
   });
 
-  function authenticatedAccount(request: Request, response: Response) {
-    const token = readCookie(request, SESSION_COOKIE);
-    const account = token
-      ? authenticateBrowserSession(database, token, config.sessionIdleSeconds)
-      : undefined;
-    if (!account) {
-      errorResponse(response, 401, {
+  function requireAuthentication(request: Request, response: Response, next: NextFunction) {
+    const cookieToken = readCookie(request, SESSION_COOKIE);
+    const bearerToken = readBearerToken(request);
+    if ((!cookieToken && !bearerToken) || (cookieToken && bearerToken)) {
+      return errorResponse(response, 401, {
         code: "AUTHENTICATION_REQUIRED",
         message: "Sign in to continue",
       });
     }
-    return account;
+
+    const source = cookieToken ? "cookie" : "bearer";
+    const authenticated = authenticateCredential(
+      database,
+      cookieToken ?? bearerToken!,
+      config.sessionIdleSeconds,
+      cookieToken
+        ? [sessionClientKinds.browser]
+        : [sessionClientKinds.script, sessionClientKinds.android, sessionClientKinds.ios],
+      clock(),
+    );
+    if (!authenticated) {
+      return errorResponse(response, 401, {
+        code: "AUTHENTICATION_REQUIRED",
+        message: "Sign in to continue",
+      });
+    }
+
+    response.locals.authentication = { ...authenticated, source } satisfies AuthenticatedRequest;
+    response.setHeader("cache-control", "no-store");
+    next();
   }
 
-  app.get("/api/v1/auth/me", (request, response) => {
-    const account = authenticatedAccount(request, response);
-    if (!account) return;
+  function authenticatedRequest(response: Response) {
+    return response.locals.authentication as AuthenticatedRequest;
+  }
 
-    response.setHeader("cache-control", "no-store");
+  app.get("/api/v1/auth/me", requireAuthentication, (_request, response) => {
+    const { account } = authenticatedRequest(response);
     return currentAccountResponse(response, account);
   });
 
-  app.post("/api/v1/capture-batches", (request, response) => {
-    const account = authenticatedAccount(request, response);
-    if (!account) return;
+  app.post("/api/v1/auth/logout", requireAuthentication, (_request, response) => {
+    const authentication = authenticatedRequest(response);
+    revokeCredential(database, authentication.credential.id, clock());
+    if (authentication.source === "cookie") clearSessionCookie(response, config);
+    logger.info({
+      event: "authentication_logout",
+      username: authentication.account.username,
+      clientKind: authentication.credential.clientKind,
+    });
+    return response.status(204).send();
+  });
 
+  app.post(
+    "/api/v1/auth/change-password",
+    requireAuthentication,
+    async (request, response) => {
+      const parsed = changePasswordRequestSchema.safeParse(request.body);
+      if (!parsed.success) {
+        return errorResponse(response, 400, {
+          code: "INVALID_REQUEST",
+          message: "Password change request is invalid",
+        });
+      }
+
+      const authentication = authenticatedRequest(response);
+      const changed = await changeLocalAccountPassword(
+        database,
+        authentication.account.id,
+        parsed.data.currentPassword,
+        parsed.data.newPassword,
+        clock(),
+      );
+      if (!changed) {
+        logger.warn({
+          event: "password_change_failure",
+          username: authentication.account.username,
+        });
+        return errorResponse(response, 401, {
+          code: "INVALID_CREDENTIALS",
+          message: "Current password is incorrect",
+        });
+      }
+
+      if (authentication.source === "cookie") clearSessionCookie(response, config);
+      logger.info({ event: "password_change_success", username: authentication.account.username });
+      return response.status(204).send();
+    },
+  );
+
+  app.post("/api/v1/capture-batches", requireAuthentication, (request, response) => {
+    const { account } = authenticatedRequest(response);
     const parsed = captureBatchRequestSchema.safeParse(request.body);
     if (!parsed.success) {
       return errorResponse(response, 400, {
@@ -185,7 +317,6 @@ export function createApp({
     }
 
     const result = saveTextCaptureBatch(database, account.id, parsed.data);
-    response.setHeader("cache-control", "no-store");
     return validatedJson(
       response,
       result.batch.result === "created" ? 201 : 200,
@@ -194,10 +325,8 @@ export function createApp({
     );
   });
 
-  app.get("/api/v1/captures", (request, response) => {
-    const account = authenticatedAccount(request, response);
-    if (!account) return;
-
+  app.get("/api/v1/captures", requireAuthentication, (request, response) => {
+    const { account } = authenticatedRequest(response);
     const query = captureListQuerySchema.safeParse(request.query);
     if (!query.success) {
       return errorResponse(response, 400, {
@@ -208,7 +337,6 @@ export function createApp({
 
     try {
       const result = listTextCaptures(database, account.id, query.data);
-      response.setHeader("cache-control", "no-store");
       return validatedJson(response, 200, captureListResponseSchema, result);
     } catch (error) {
       if (error instanceof InvalidCaptureCursorError) {

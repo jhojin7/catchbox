@@ -13,6 +13,8 @@ import {
   type HttpFetcher,
 } from "./http-api";
 
+type BrowserLoginRequest = Pick<LoginRequest, "username" | "password">;
+
 export class AuthenticationApiError extends Error {
   constructor(
     message: string,
@@ -40,10 +42,13 @@ export async function fetchCurrentAccount(
 }
 
 export async function loginWithPassword(
-  credentials: LoginRequest,
+  credentials: BrowserLoginRequest,
   fetcher: HttpFetcher = fetch,
 ): Promise<CurrentAccount> {
-  const request = loginRequestSchema.parse(credentials);
+  const request = loginRequestSchema.parse({
+    username: credentials.username,
+    password: credentials.password,
+  });
   const response = await fetcher("/api/v1/auth/login", {
     method: "POST",
     headers: { "content-type": "application/json", accept: "application/json" },

@@ -38,7 +38,10 @@ export const sessions = sqliteTable(
   (table) => [
     uniqueIndex("sessions_token_hash_unique").on(table.tokenHash),
     index("sessions_user_id_index").on(table.userId),
-    check("sessions_client_kind_check", sql`${table.clientKind} = 'browser'`),
+    check(
+      "sessions_client_kind_check",
+      sql`${table.clientKind} in ('browser', 'script', 'android', 'ios')`,
+    ),
   ],
 );
 

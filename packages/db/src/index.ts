@@ -2,15 +2,16 @@ import { Database as SQLiteDatabase } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
-  sessionClientKinds,
   type CaptureBatchRequest,
   type CaptureBatchResponse,
   type CaptureListResponse,
   type CaptureWriteResult,
+  type SessionClientKind,
 } from "@catchbox/shared";
 import { and, count, desc, eq, isNull, lt, or } from "drizzle-orm";
 import { drizzle, type BunSQLiteDatabase } from "drizzle-orm/bun-sqlite";
 import { migrate } from "drizzle-orm/bun-sqlite/migrator";
+import { hashPassword } from "./password";
 import * as schema from "./schema";
 
 const LOCAL_ACCOUNT_KEY = "local-v1-account";
@@ -62,11 +63,7 @@ export async function bootstrapLocalAccount(
 
   const now = new Date().toISOString();
   const account = { id: crypto.randomUUID(), username };
-  const passwordHash = await Bun.password.hash(password, {
-    algorithm: "argon2id",
-    memoryCost: 65_536,
-    timeCost: 3,
-  });
+  const passwordHash = await hashPassword(password);
 
   database.orm.insert(schema.users).values({
     ...account,
@@ -132,9 +129,10 @@ export async function verifyLocalAccountPassword(
   return account;
 }
 
-export function createBrowserSession(
+export function createCredential(
   database: CatchboxDatabase,
   user: schema.UserRow,
+  clientKind: SessionClientKind,
   lifetimes: { idleSeconds: number; absoluteSeconds: number },
   now = new Date(),
 ) {
@@ -147,7 +145,7 @@ export function createBrowserSession(
     id: crypto.randomUUID(),
     tokenHash: hashSessionToken(token),
     userId: user.id,
-    clientKind: sessionClientKinds.browser,
+    clientKind,
     sessionVersion: user.sessionVersion,
     idleExpiresAt: idleExpiresAt.toISOString(),
     absoluteExpiresAt: absoluteExpiresAt.toISOString(),
@@ -159,10 +157,11 @@ export function createBrowserSession(
   return { token, absoluteExpiresAt };
 }
 
-export function authenticateBrowserSession(
+export function authenticateCredential(
   database: CatchboxDatabase,
   token: string,
   idleSeconds: number,
+  allowedClientKinds: readonly SessionClientKind[],
   now = new Date(),
 ) {
   const match = database.orm
@@ -172,7 +171,6 @@ export function authenticateBrowserSession(
     .where(
       and(
         eq(schema.sessions.tokenHash, hashSessionToken(token)),
-        eq(schema.sessions.clientKind, sessionClientKinds.browser),
         isNull(schema.sessions.revokedAt),
       ),
     )
@@ -180,6 +178,7 @@ export function authenticateBrowserSession(
 
   if (
     !match ||
+    !allowedClientKinds.includes(match.session.clientKind) ||
     match.session.sessionVersion !== match.user.sessionVersion ||
     match.session.idleExpiresAt <= now.toISOString() ||
     match.session.absoluteExpiresAt <= now.toISOString()
@@ -199,7 +198,71 @@ export function authenticateBrowserSession(
     .where(eq(schema.sessions.id, match.session.id))
     .run();
 
-  return match.user;
+  return {
+    account: match.user,
+    credential: {
+      id: match.session.id,
+      clientKind: match.session.clientKind,
+    },
+  };
+}
+
+export function revokeCredential(
+  database: CatchboxDatabase,
+  credentialId: string,
+  now = new Date(),
+) {
+  database.orm
+    .update(schema.sessions)
+    .set({ revokedAt: now.toISOString() })
+    .where(and(eq(schema.sessions.id, credentialId), isNull(schema.sessions.revokedAt)))
+    .run();
+}
+
+export async function changeLocalAccountPassword(
+  database: CatchboxDatabase,
+  userId: string,
+  currentPassword: string,
+  newPassword: string,
+  now = new Date(),
+) {
+  const account = database.orm
+    .select()
+    .from(schema.users)
+    .where(eq(schema.users.id, userId))
+    .get();
+  if (!account || !(await Bun.password.verify(currentPassword, account.passwordHash))) return false;
+
+  const passwordHash = await hashPassword(newPassword);
+  const changedAt = now.toISOString();
+
+  return database.orm.transaction((transaction) => {
+    const updated = transaction
+      .update(schema.users)
+      .set({
+        passwordHash,
+        sessionVersion: account.sessionVersion + 1,
+        updatedAt: changedAt,
+      })
+      .where(
+        and(
+          eq(schema.users.id, account.id),
+          eq(schema.users.passwordHash, account.passwordHash),
+          eq(schema.users.sessionVersion, account.sessionVersion),
+        ),
+      )
+      .returning({ id: schema.users.id })
+      .get();
+    if (!updated) return false;
+
+    transaction
+      .update(schema.sessions)
+      .set({ revokedAt: changedAt })
+      .where(and(eq(schema.sessions.userId, account.id), isNull(schema.sessions.revokedAt)))
+      .run();
+
+    return true;
+  });
 }
 
 function captureResponse(

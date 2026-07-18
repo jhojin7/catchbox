@@ -4,6 +4,14 @@ export const loginRequestSchema = z
   .object({
     username: z.string().trim().min(1),
     password: z.string().min(1),
+    clientKind: z.enum(["script", "android", "ios"]).optional(),
+  })
+  .strict();
+
+export const changePasswordRequestSchema = z
+  .object({
+    currentPassword: z.string().min(1),
+    newPassword: z.string().min(12),
   })
   .strict();
 
@@ -30,13 +38,22 @@ export const currentAccountSchema = z
   })
   .strict();
 
+export const tokenLoginResponseSchema = z
+  .object({
+    account: currentAccountSchema,
+    token: z.string().min(1),
+    tokenType: z.literal("Bearer"),
+    expiresAt: z.iso.datetime(),
+  })
+  .strict();
+
 export const healthResponseSchema = z
   .object({
     status: z.enum(["live", "ready", "not_ready"]),
   })
   .strict();
 
-export const sessionClientKindSchema = z.enum(["browser"]);
+export const sessionClientKindSchema = z.enum(["browser", "script", "android", "ios"]);
 export const sessionClientKinds = sessionClientKindSchema.enum;
 
 export const captureCursorSchema = z.string().regex(/^[A-Za-z0-9_-]+$/);
@@ -124,8 +141,10 @@ export const captureListResponseSchema = z
   .strict();
 
 export type LoginRequest = z.infer<typeof loginRequestSchema>;
+export type ChangePasswordRequest = z.infer<typeof changePasswordRequestSchema>;
 export type ErrorEnvelope = z.infer<typeof errorEnvelopeSchema>;
 export type CurrentAccount = z.infer<typeof currentAccountSchema>;
+export type TokenLoginResponse = z.infer<typeof tokenLoginResponseSchema>;
 export type HealthResponse = z.infer<typeof healthResponseSchema>;
 export type ErrorCode = z.infer<typeof errorCodeSchema>;
 export type SessionClientKind = z.infer<typeof sessionClientKindSchema>;
