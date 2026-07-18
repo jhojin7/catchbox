@@ -3,8 +3,14 @@
 Catchbox exposes its online JSON API under `/api/v1`. Every capture and inbox request requires an
 authenticated session and a live connection, even on a trusted local network. The current script
 workflow uses the same opaque cookie session as the PWA; token credential lifecycle is outside this
-API slice. The PWA does not yet durably store pending requests or retry after reconnecting; that
-local-first behavior is assigned to [issue #4](https://github.com/jhojin7/catchbox/issues/4).
+API slice. Before using this API, the PWA stores the complete identified text batch in its IndexedDB
+outbox. It then submits pending work on reconnect or foreground startup while the browser session is
+authenticated. Repeated submissions retain their original client IDs and rely on this endpoint's
+idempotency guarantees. Offline shell access is tied to one explicit local account marker. Login
+and authenticated account checks update it; successful in-app logout and observed unauthenticated
+responses clear it while retaining that account's outbox. Remote session invalidation cannot be
+observed by a client that remains continuously offline, so the marker is cleared when that client
+next receives an unauthenticated server response.
 
 The examples assume `CATCHBOX_URL` contains the Catchbox origin, such as
 `http://catchbox.home:3000`. Keep the cookie jar private and remove it when the script finishes.
@@ -29,7 +35,7 @@ Successful login returns the public account identity. Capture requests send the 
 Clients generate and retain one UUID for the batch and one UUID for the item before submission.
 `capturedAt` is an RFC 3339 timestamp with an offset. This online slice accepts exactly one non-empty
 text item per JSON batch; URLs, attachments, multipart requests, and offline retry are not part of
-this endpoint yet.
+the endpoint itself.
 
 ```sh
 curl --fail-with-body \

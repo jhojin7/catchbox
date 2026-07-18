@@ -77,13 +77,19 @@ The implementation will proceed in small vertical slices:
 ## Local quick-capture start
 
 Catchbox currently provides validated startup configuration, the single local account, health
-checks, online text quick-capture, and a chronological protected PWA inbox. The shell is installable
+checks, local-first text quick-capture, and a chronological protected PWA inbox. The shell is installable
 when Catchbox is served from a browser-supported secure context (including localhost for
-development). The service worker caches only the static shell needed to open the login surface
-without a network response. Text quick-capture currently requires a live connection: the PWA does
-not yet persist a pending capture locally or retry it after reconnecting. Durable offline capture,
-pending-work display, and reconnect synchronization are assigned to
-[issue #4](https://github.com/jhojin7/catchbox/issues/4) and are not provided by this slice.
+development). The service worker caches the static shell so a previously authenticated browser can
+open offline and see pending local work only for the exact account named by a durable local
+authorization marker. A valid login or `/auth/me` response sets that marker. Successful in-app
+logout or an observed unauthenticated server response clears it without deleting pending work, so
+the same account can later reauthenticate and drain the original client identities. A browser that
+remains continuously offline cannot learn about a logout or password invalidation performed
+elsewhere until it receives a server response. Text captures are assigned stable client UUIDs and
+stored in a single IndexedDB transaction before success is shown or submission starts. Pending work
+drains through the authenticated batch API on reconnect and foreground startup; eligible browsers
+may also request a service-worker background sync. Bounded backoff, ambiguous-response
+reconciliation, and manual retry/discard controls remain later work.
 
 1. Install the pinned Bun workspace dependencies and create local configuration:
 

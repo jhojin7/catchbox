@@ -61,3 +61,16 @@ export async function loginWithPassword(
     (message, code) => new AuthenticationApiError(message, code),
   );
 }
+
+export async function logoutCurrentSession(fetcher: HttpFetcher = fetch) {
+  const response = await fetcher("/api/v1/auth/logout", {
+    method: "POST",
+    headers: { accept: "application/json" },
+  });
+  if (response.status === 204) return;
+
+  return throwValidatedApiError(
+    response,
+    (message, code) => new AuthenticationApiError(message, code),
+  );
+}

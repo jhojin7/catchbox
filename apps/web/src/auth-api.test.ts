@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { AuthenticationApiError, fetchCurrentAccount, loginWithPassword } from "./auth-api";
+import {
+  AuthenticationApiError,
+  fetchCurrentAccount,
+  loginWithPassword,
+  logoutCurrentSession,
+} from "./auth-api";
 
 function responseWith(body: unknown, status = 200) {
   return async () =>
@@ -58,5 +63,19 @@ describe("browser authentication API", () => {
         responseWith({ code: "UNKNOWN", message: "untrusted" }, 500),
       ),
     ).rejects.toThrow("Catchbox returned an invalid response");
+  });
+
+  test("logs out through the authenticated session endpoint", async () => {
+    let request: { input?: string | URL | Request; init?: RequestInit } = {};
+
+    await expect(
+      logoutCurrentSession(async (input, init) => {
+        request = { input, init };
+        return new Response(null, { status: 204 });
+      }),
+    ).resolves.toBeUndefined();
+
+    expect(request.input).toBe("/api/v1/auth/logout");
+    expect(request.init).toMatchObject({ method: "POST" });
   });
 });

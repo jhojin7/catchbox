@@ -4,8 +4,19 @@ import {
   AuthenticationApiError,
   fetchCurrentAccount,
   loginWithPassword,
+  logoutCurrentSession,
 } from "./auth-api";
-import { fetchCaptureInbox, submitTextCapture } from "./capture-api";
+import { CaptureApiError, fetchCaptureInbox } from "./capture-api";
+import {
+  authorizeOfflineAccount,
+  clearOfflineAuthorization,
+  drainPendingCaptures,
+  listLocalCaptures,
+  loadOfflineAuthorizedAccount,
+  OUTBOX_SYNC_TAG,
+  savePendingTextCapture,
+  type LocalCaptureItem,
+} from "./local-captures";
 
 type AuthenticationState =
   | { status: "checking" }
@@ -17,16 +28,42 @@ export function App() {
 
   useEffect(() => {
     let active = true;
-    fetchCurrentAccount()
-      .then((account) => {
+    async function restoreAuthentication() {
+      let account: CurrentAccount | undefined;
+      try {
+        account = await fetchCurrentAccount();
+      } catch {
+        const offlineAccount = await loadOfflineAuthorizedAccount().catch(() => undefined);
         if (!active) return;
-        setAuthentication(account ? { status: "signed-in", account } : { status: "signed-out" });
-      })
-      .catch(() => active && setAuthentication({ status: "signed-out" }));
+        setAuthentication(
+          offlineAccount
+            ? { status: "signed-in", account: offlineAccount }
+            : { status: "signed-out" },
+        );
+        return;
+      }
+
+      if (!account) {
+        await clearOfflineAuthorization().catch(() => undefined);
+        if (active) setAuthentication({ status: "signed-out" });
+        return;
+      }
+      await authorizeOfflineAccount(account).catch(async () => {
+        await clearOfflineAuthorization().catch(() => undefined);
+      });
+      if (active) setAuthentication({ status: "signed-in", account });
+    }
+
+    void restoreAuthentication();
     return () => {
       active = false;
     };
   }, []);
+
+  async function revokeOfflineAccess() {
+    await clearOfflineAuthorization();
+    setAuthentication({ status: "signed-out" });
+  }
 
   if (authentication.status === "checking") {
     return <main className="centered" aria-busy="true">Opening Catchbox…</main>;
@@ -40,7 +77,7 @@ export function App() {
     );
   }
 
-  return <ProtectedShell account={authentication.account} />;
+  return <ProtectedShell account={authentication.account} onSignedOut={revokeOfflineAccess} />;
 }
 
 function Login({ onSignedIn }: { onSignedIn(account: CurrentAccount): void }) {
@@ -54,7 +91,9 @@ function Login({ onSignedIn }: { onSignedIn(account: CurrentAccount): void }) {
     setSubmitting(true);
     setError(undefined);
     try {
-      onSignedIn(await loginWithPassword({ username, password }));
+      const account = await loginWithPassword({ username, password });
+      await authorizeOfflineAccount(account);
+      onSignedIn(account);
     } catch (error) {
       setError(
         error instanceof AuthenticationApiError
@@ -104,24 +143,47 @@ function Login({ onSignedIn }: { onSignedIn(account: CurrentAccount): void }) {
   );
 }
 
-function ProtectedShell({ account }: { account: CurrentAccount }) {
+function ProtectedShell({
+  account,
+  onSignedOut,
+}: {
+  account: CurrentAccount;
+  onSignedOut(): Promise<void>;
+}) {
   const [text, setText] = useState("");
-  const [captures, setCaptures] = useState<CaptureListItem[]>([]);
+  const [captures, setCaptures] = useState<VisibleCapture[]>([]);
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [notice, setNotice] = useState<string>();
   const [error, setError] = useState<string>();
+  const [offline, setOffline] = useState(!navigator.onLine);
+  const [signingOut, setSigningOut] = useState(false);
 
   useEffect(() => {
     let active = true;
-    fetchCaptureInbox()
-      .then((page) => active && setCaptures(page.captures))
-      .catch(() => active && setError("The inbox could not be loaded. Try reloading Catchbox."))
-      .finally(() => active && setLoading(false));
+    async function refreshAndDrain() {
+      const result = await synchronizeCaptures(account.id);
+      if (!active) return;
+      if (result.status === "authentication-required") {
+        await onSignedOut();
+        return;
+      }
+      setCaptures(result.captures);
+      setOffline(result.offline);
+      setError(undefined);
+      setLoading(false);
+    }
+
+    void listLocalCaptures(account.id).then((local) => {
+      if (active) setCaptures(mergeCaptures(local, []));
+    });
+    void refreshAndDrain();
+    window.addEventListener("online", refreshAndDrain);
     return () => {
       active = false;
+      window.removeEventListener("online", refreshAndDrain);
     };
-  }, []);
+  }, [account.id]);
 
   async function capture(event: FormEvent) {
     event.preventDefault();
@@ -132,41 +194,45 @@ function ProtectedShell({ account }: { account: CurrentAccount }) {
     setNotice(undefined);
     setError(undefined);
     try {
-      const clientBatchId = crypto.randomUUID();
-      const clientItemId = crypto.randomUUID();
-      const capturedAt = new Date().toISOString();
-      const result = await submitTextCapture({
-        clientBatchId,
-        capturedAt,
-        source: { platform: "web", app: "catchbox-pwa" },
-        items: [
-          {
-            clientItemId,
-            type: "text",
-            text: capturedText,
-          },
-        ],
-      });
-      const persistedItem: CaptureListItem = {
-        id: result.items[0].id,
-        batchId: result.batch.id,
-        clientItemId: result.items[0].clientItemId,
-        type: "text",
-        text: capturedText,
-        state: result.items[0].state,
-        capturedAt: result.batch.capturedAt,
-        receivedAt: result.batch.receivedAt,
-      };
+      const persistedItem = await savePendingTextCapture(account.id, capturedText);
       setCaptures((current) => [
         persistedItem,
-        ...current.filter((item) => item.id !== persistedItem.id),
+        ...current.filter((item) => item.clientItemId !== persistedItem.clientItemId),
       ]);
       setText("");
-      setNotice("Capture saved");
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "The capture could not be saved.");
+      setNotice("Capture saved locally");
+      void requestBackgroundSync();
+      void synchronizeCaptures(account.id).then((result) => {
+        if (result.status === "authentication-required") {
+          void onSignedOut();
+          return;
+        }
+        setOffline(result.offline);
+        setCaptures(result.captures);
+      });
+    } catch {
+      setError("The capture could not be saved on this device.");
     } finally {
       setSubmitting(false);
+    }
+  }
+
+  async function signOut() {
+    setSigningOut(true);
+    setError(undefined);
+    try {
+      await logoutCurrentSession();
+      await onSignedOut();
+    } catch (error) {
+      if (
+        error instanceof AuthenticationApiError &&
+        error.code === "AUTHENTICATION_REQUIRED"
+      ) {
+        await onSignedOut();
+        return;
+      }
+      setError("Catchbox could not sign out. Check the server and try again.");
+      setSigningOut(false);
     }
   }
 
@@ -177,14 +243,21 @@ function ProtectedShell({ account }: { account: CurrentAccount }) {
           <p className="eyebrow">Catchbox</p>
           <h1>Capture inbox</h1>
         </div>
-        <p className="identity">Signed in as {account.username}</p>
+        <div className="account-actions">
+          <p className="identity">Signed in as {account.username}</p>
+          <button type="button" className="secondary" onClick={signOut} disabled={signingOut}>
+            {signingOut ? "Signing out…" : "Sign out"}
+          </button>
+        </div>
       </header>
       <div className="inbox-layout">
         <section className="quick-capture card" aria-labelledby="quick-capture-title">
           <p className="eyebrow">New item</p>
           <h2 id="quick-capture-title">Quick capture</h2>
           <p className="connection-note">
-            Requires a live connection. Offline saving and retry are not available yet.
+            {offline
+              ? "Working offline. Pending captures will sync when Catchbox reconnects."
+              : "Saved on this device first, then synchronized with Catchbox."}
           </p>
           <form onSubmit={capture}>
             <label htmlFor="capture-text">Capture text</label>
@@ -192,6 +265,7 @@ function ProtectedShell({ account }: { account: CurrentAccount }) {
               id="capture-text"
               name="text"
               rows={6}
+              maxLength={50_000}
               required
               value={text}
               onChange={(event) => setText(event.target.value)}
@@ -220,11 +294,20 @@ function ProtectedShell({ account }: { account: CurrentAccount }) {
           ) : (
             <ol className="capture-list">
               {captures.map((item) => (
-                <li className="capture-item" key={item.id}>
+                <li
+                  className="capture-item"
+                  key={item.clientItemId}
+                  data-client-item-id={item.clientItemId}
+                >
                   <p>{item.text}</p>
-                  <time dateTime={item.receivedAt}>
-                    {new Date(item.receivedAt).toLocaleString()}
-                  </time>
+                  <div className="capture-meta">
+                    <span className={`sync-status ${item.syncStatus}`} aria-live="polite">
+                      {item.syncStatus === "pending" ? "Pending" : "Synced"}
+                    </span>
+                    <time dateTime={item.receivedAt ?? item.capturedAt}>
+                      {new Date(item.receivedAt ?? item.capturedAt).toLocaleString()}
+                    </time>
+                  </div>
                 </li>
               ))}
             </ol>
@@ -233,4 +316,66 @@ function ProtectedShell({ account }: { account: CurrentAccount }) {
       </div>
     </main>
   );
+}
+
+interface VisibleCapture {
+  clientItemId: string;
+  text: string;
+  syncStatus: LocalCaptureItem["syncStatus"];
+  capturedAt: string;
+  receivedAt?: string;
+}
+
+async function synchronizeCaptures(accountId: string) {
+  try {
+    await drainPendingCaptures({ accountId });
+  } catch (error) {
+    if (error instanceof CaptureApiError && error.code === "AUTHENTICATION_REQUIRED") {
+      return { status: "authentication-required" } as const;
+    }
+    throw error;
+  }
+  const local = await listLocalCaptures(accountId);
+  try {
+    const remote = (await fetchCaptureInbox()).captures;
+    return { captures: mergeCaptures(local, remote), offline: false };
+  } catch (error) {
+    if (error instanceof CaptureApiError && error.code === "AUTHENTICATION_REQUIRED") {
+      return { status: "authentication-required" } as const;
+    }
+    return { captures: mergeCaptures(local, []), offline: true };
+  }
+}
+
+function mergeCaptures(local: LocalCaptureItem[], remote: CaptureListItem[]) {
+  const byClientItemId = new Map<string, VisibleCapture>();
+  for (const item of remote) {
+    byClientItemId.set(item.clientItemId, {
+      clientItemId: item.clientItemId,
+      text: item.text,
+      syncStatus: "synced",
+      capturedAt: item.capturedAt,
+      receivedAt: item.receivedAt,
+    });
+  }
+  for (const item of local) byClientItemId.set(item.clientItemId, item);
+  return [...byClientItemId.values()].sort((left, right) => {
+    const timeOrder = (right.receivedAt ?? right.capturedAt).localeCompare(
+      left.receivedAt ?? left.capturedAt,
+    );
+    return timeOrder || right.clientItemId.localeCompare(left.clientItemId);
+  });
+}
+
+async function requestBackgroundSync() {
+  try {
+    if (!("serviceWorker" in navigator)) return;
+    const registration = await navigator.serviceWorker.ready;
+    const backgroundSync = registration as ServiceWorkerRegistration & {
+      sync?: { register(tag: string): Promise<void> };
+    };
+    await backgroundSync.sync?.register(OUTBOX_SYNC_TAG);
+  } catch {
+    // Foreground startup and online events remain the portable sync path.
+  }
 }

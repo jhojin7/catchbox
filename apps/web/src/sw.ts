@@ -1,5 +1,15 @@
 /// <reference lib="webworker" />
 
+import { fetchCurrentAccount } from "./auth-api";
+import { CaptureApiError } from "./capture-api";
+import {
+  clearOfflineAuthorizationIfCurrent,
+  drainPendingCaptures,
+  loadOfflineAuthorizationSnapshot,
+  loadOfflineAuthorizedAccount,
+  OUTBOX_SYNC_TAG,
+} from "./local-captures";
+
 const serviceWorker = self as unknown as ServiceWorkerGlobalScope;
 const CACHE_NAME = "catchbox-shell-v1";
 const STATIC_SHELL = [
@@ -45,3 +55,36 @@ serviceWorker.addEventListener("fetch", (event) => {
     }),
   );
 });
+
+serviceWorker.addEventListener("sync", ((event: ExtendableEvent & { tag: string }) => {
+  if (event.tag === OUTBOX_SYNC_TAG) {
+    event.waitUntil(
+      loadOfflineAuthorizationSnapshot().then(async (authorization) => {
+        if (!authorization) return;
+        const account = await fetchCurrentAccount();
+        if (!account) {
+          await clearOfflineAuthorizationIfCurrent(authorization.generation);
+          return;
+        }
+        // A delayed background response must never resurrect access after foreground logout.
+        const offlineAccount = await loadOfflineAuthorizedAccount();
+        const currentAuthorization = await loadOfflineAuthorizationSnapshot();
+        if (
+          offlineAccount?.id !== account.id ||
+          currentAuthorization?.generation !== authorization.generation
+        ) {
+          return;
+        }
+        try {
+          await drainPendingCaptures({ accountId: account.id });
+        } catch (error) {
+          if (error instanceof CaptureApiError && error.code === "AUTHENTICATION_REQUIRED") {
+            await clearOfflineAuthorizationIfCurrent(authorization.generation);
+            return;
+          }
+          throw error;
+        }
+      }),
+    );
+  }
+}) as EventListener);
