@@ -1,0 +1,23 @@
+{
+  "name": "@catchbox/api",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun --watch src/index.ts",
+    "start": "bun src/index.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "bun test",
+    "build": "bun build src/index.ts --outdir dist --target bun"
+  },
+  "dependencies": {
+    "@catchbox/config": "workspace:*",
+    "@catchbox/db": "workspace:*",
+    "@catchbox/shared": "workspace:*",
+    "express": "^5.1.0",
+    "pino": "^9.9.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3"
+  }
+}

@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title">
+  <title id="title">Catchbox</title>
+  <rect width="512" height="512" rx="112" fill="#14213d"/>
+  <path d="M126 176c0-22 18-40 40-40h180c22 0 40 18 40 40v160c0 22-18 40-40 40H166c-22 0-40-18-40-40V176Z" fill="#fffdf8"/>
+  <path d="M126 270h82l24 38h48l24-38h82v66c0 22-18 40-40 40H166c-22 0-40-18-40-40v-66Z" fill="#f4c95d"/>
+  <path d="M256 118v116m0 0-42-42m42 42 42-42" fill="none" stroke="#b14c2f" stroke-width="28" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

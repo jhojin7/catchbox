@@ -74,6 +74,54 @@ The implementation will proceed in small vertical slices:
 7. Android and iOS share integrations.
 8. ARM64 deployment, export, operations documentation, and recovery drills.
 
+## Local sign-in quick start
+
+Catchbox currently provides the first vertical slice: validated startup configuration, the single
+local account, health checks, and a protected PWA shell that is installable when Catchbox is served
+from a browser-supported secure context (including localhost for development). The service worker
+caches only the static shell needed to open the login surface without a network response. Durable
+offline capture, pending-work display, and reconnect synchronization remain part of the later
+offline-capture slice and are not provided here.
+
+1. Install the pinned Bun workspace dependencies and create local configuration:
+
+   ```sh
+   bun install --frozen-lockfile
+   cp .env.example .env
+   ```
+
+2. Edit `.env`. Set a private runtime directory, a local username, and a password of at least 12
+   characters. The `.env` file and runtime SQLite files are ignored by Git.
+
+3. Prepare the empty database and bootstrap the account:
+
+   ```sh
+   bun run db:migrate
+   bun run auth:bootstrap
+   ```
+
+   Bootstrap is repeatable: after the local account exists, running it again does not create or
+   overwrite another account.
+
+4. Build and start Catchbox:
+
+   ```sh
+   bun run build
+   bun run start
+   ```
+
+5. Open the configured host and port (by default `http://localhost:3000`). Live and ready status are
+   available at `/api/v1/health/live` and `/api/v1/health/ready`; neither exposes configuration or
+   account data.
+
+Repository quality gates are available from the root:
+
+```sh
+bun run typecheck
+bun run test
+bun run build
+```
+
 ## Documentation
 
 - [Implementation plan](PLAN.md) — product scope, architecture, interfaces, and delivery sequence.

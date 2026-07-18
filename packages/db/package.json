@@ -1,0 +1,24 @@
+{
+  "name": "@catchbox/db",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "migrate": "bun src/cli/migrate.ts",
+    "bootstrap": "bun src/cli/bootstrap.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "bun test",
+    "build": "bun build src/index.ts --outdir dist --target bun"
+  },
+  "dependencies": {
+    "@catchbox/config": "workspace:*",
+    "@catchbox/shared": "workspace:*",
+    "drizzle-orm": "^0.44.5"
+  },
+  "devDependencies": {
+    "drizzle-kit": "^0.31.4"
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "name": "catchbox",
+  "private": true,
+  "packageManager": "bun@1.3.14",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "bun run --filter @catchbox/api dev",
+    "start": "bun run --filter @catchbox/api start",
+    "db:migrate": "bun run --filter @catchbox/db migrate",
+    "auth:bootstrap": "bun run --filter @catchbox/db bootstrap",
+    "typecheck": "tsc --noEmit -p tsconfig.e2e.json && bun run --filter '*' typecheck",
+    "test:unit": "bun test",
+    "test:browser": "playwright test",
+    "test": "bun run test:unit && bun run test:browser",
+    "build": "bun run --filter '*' build"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.55.0",
+    "@types/bun": "^1.2.20",
+    "typescript": "^5.9.2"
+  }
+}
