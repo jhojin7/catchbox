@@ -7,7 +7,7 @@
 
 * { box-sizing: border-box; }
 body { margin: 0; min-width: 320px; min-height: 100vh; }
-button, input { font: inherit; }
+button, input, textarea { font: inherit; }
 
 .centered {
   min-height: 100vh;
@@ -31,19 +31,34 @@ h1 { margin: 0; font-size: clamp(2rem, 8vw, 3.25rem); line-height: 1; letter-spa
 .lede { color: #4d5668; line-height: 1.6; }
 form { display: grid; gap: 1rem; margin-top: 2rem; }
 label { display: grid; gap: 0.45rem; font-weight: 700; }
-input { width: 100%; border: 1px solid #9299a6; border-radius: 0.65rem; padding: 0.8rem 0.9rem; background: white; color: #14213d; }
-input:focus { outline: 3px solid #f4c95d88; border-color: #14213d; }
+input, textarea { width: 100%; border: 1px solid #9299a6; border-radius: 0.65rem; padding: 0.8rem 0.9rem; background: white; color: #14213d; }
+textarea { resize: vertical; line-height: 1.5; }
+input:focus, textarea:focus { outline: 3px solid #f4c95d88; border-color: #14213d; }
 button { border: 0; border-radius: 0.65rem; padding: 0.85rem 1rem; color: white; background: #14213d; font-weight: 800; cursor: pointer; }
 button:disabled { cursor: wait; opacity: 0.65; }
 .error { margin: 0; color: #9d2c1d; font-weight: 700; }
+.success { margin: 1rem 0 0; color: #28734b; font-weight: 700; }
 
 .app-shell { max-width: 72rem; margin: 0 auto; padding: clamp(1.5rem, 5vw, 4rem); }
 .app-shell header { display: flex; align-items: end; justify-content: space-between; gap: 2rem; padding-bottom: 2rem; border-bottom: 1px solid #14213d22; }
 .identity { color: #4d5668; }
-.empty-state { margin-top: 3rem; padding: clamp(2rem, 7vw, 5rem); border: 1px dashed #9299a6; border-radius: 1.25rem; text-align: center; background: #fffdf8; }
-.empty-state h2 { margin-top: 0; font-size: clamp(1.5rem, 4vw, 2.25rem); }
+.inbox-layout { display: grid; grid-template-columns: minmax(16rem, 0.75fr) minmax(20rem, 1.25fr); gap: clamp(1.5rem, 4vw, 3rem); align-items: start; margin-top: 3rem; }
+.quick-capture.card { position: sticky; top: 1.5rem; width: auto; padding: clamp(1.5rem, 4vw, 2rem); }
+.quick-capture h2, .section-heading h2 { margin: 0; font-size: clamp(1.5rem, 4vw, 2.25rem); }
+.connection-note { margin: 0.75rem 0 0; color: #4d5668; font-size: 0.9rem; line-height: 1.5; }
+.quick-capture form { margin-top: 1.5rem; }
+.section-heading { padding-bottom: 1rem; border-bottom: 1px solid #14213d22; }
+.inbox-message { color: #4d5668; }
+.empty-state { margin-top: 1rem; padding: clamp(2rem, 7vw, 4rem); border: 1px dashed #9299a6; border-radius: 1.25rem; text-align: center; background: #fffdf8; }
+.empty-state h3 { margin-top: 0; font-size: 1.4rem; }
 .empty-state p { max-width: 38rem; margin: 0 auto; color: #4d5668; line-height: 1.6; }
+.capture-list { display: grid; gap: 1rem; margin: 1rem 0 0; padding: 0; list-style: none; }
+.capture-item { padding: 1.25rem; border: 1px solid #14213d22; border-radius: 1rem; background: #fffdf8; box-shadow: 0 0.5rem 1.5rem #14213d0b; }
+.capture-item p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.55; }
+.capture-item time { display: block; margin-top: 1rem; color: #697182; font-size: 0.82rem; }
 
 @media (max-width: 38rem) {
   .app-shell header { align-items: start; flex-direction: column; }
+  .inbox-layout { grid-template-columns: 1fr; }
+  .quick-capture.card { position: static; }
 }

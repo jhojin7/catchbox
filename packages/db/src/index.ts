@@ -1,8 +1,14 @@
 import { Database as SQLiteDatabase } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { sessionClientKinds } from "@catchbox/shared";
-import { and, count, eq, isNull } from "drizzle-orm";
+import {
+  sessionClientKinds,
+  type CaptureBatchRequest,
+  type CaptureBatchResponse,
+  type CaptureListResponse,
+  type CaptureWriteResult,
+} from "@catchbox/shared";
+import { and, count, desc, eq, isNull, lt, or } from "drizzle-orm";
 import { drizzle, type BunSQLiteDatabase } from "drizzle-orm/bun-sqlite";
 import { migrate } from "drizzle-orm/bun-sqlite/migrator";
 import * as schema from "./schema";
@@ -88,10 +94,10 @@ export function getDatabaseHealth(database: CatchboxDatabase) {
   };
   const tableCount = database.sqlite
     .query(
-      "SELECT COUNT(*) AS value FROM sqlite_master WHERE type = 'table' AND name IN ('users', 'sessions')",
+      "SELECT COUNT(*) AS value FROM sqlite_master WHERE type = 'table' AND name IN ('users', 'sessions', 'capture_batches', 'capture_items')",
     )
     .get() as { value: number };
-  const schemaReady = tableCount.value === 2;
+  const schemaReady = tableCount.value === 4;
   let writable = false;
 
   if (schemaReady) {
@@ -194,6 +200,197 @@ export function authenticateBrowserSession(
     .run();
 
   return match.user;
+}
+
+function captureResponse(
+  batch: schema.CaptureBatchRow,
+  item: schema.CaptureItemRow,
+  result: CaptureWriteResult,
+): CaptureBatchResponse {
+  return {
+    batch: {
+      id: batch.id,
+      clientBatchId: batch.clientBatchId,
+      result,
+      capturedAt: batch.capturedAt,
+      receivedAt: batch.receivedAt,
+    },
+    items: [
+      {
+        id: item.id,
+        clientItemId: item.clientItemId,
+        result,
+        type: "text",
+        state: "ready",
+      },
+    ],
+  };
+}
+
+export function saveTextCaptureBatch(
+  database: CatchboxDatabase,
+  userId: string,
+  request: CaptureBatchRequest,
+  now = new Date(),
+): CaptureBatchResponse {
+  return database.orm.transaction((transaction) => {
+    const matchingBatch = transaction
+      .select()
+      .from(schema.captureBatches)
+      .where(
+        and(
+          eq(schema.captureBatches.userId, userId),
+          eq(schema.captureBatches.clientBatchId, request.clientBatchId),
+        ),
+      )
+      .get();
+
+    if (matchingBatch) {
+      const item = transaction
+        .select()
+        .from(schema.captureItems)
+        .where(eq(schema.captureItems.batchId, matchingBatch.id))
+        .get();
+      if (!item) throw new Error("Stored capture batch has no item");
+      return captureResponse(matchingBatch, item, "existing");
+    }
+
+    const requestedItem = request.items[0];
+    const matchingItem = transaction
+      .select()
+      .from(schema.captureItems)
+      .where(
+        and(
+          eq(schema.captureItems.userId, userId),
+          eq(schema.captureItems.clientItemId, requestedItem.clientItemId),
+        ),
+      )
+      .get();
+
+    if (matchingItem) {
+      const batch = transaction
+        .select()
+        .from(schema.captureBatches)
+        .where(eq(schema.captureBatches.id, matchingItem.batchId))
+        .get();
+      if (!batch) throw new Error("Stored capture item has no batch");
+      return captureResponse(batch, matchingItem, "existing");
+    }
+
+    const receivedAt = now.toISOString();
+    const batch: schema.CaptureBatchRow = {
+      id: crypto.randomUUID(),
+      userId,
+      clientBatchId: request.clientBatchId,
+      sourcePlatform: request.source?.platform ?? null,
+      sourceApp: request.source?.app ?? null,
+      capturedAt: request.capturedAt,
+      receivedAt,
+    };
+    const item: schema.CaptureItemRow = {
+      id: crypto.randomUUID(),
+      batchId: batch.id,
+      userId,
+      clientItemId: requestedItem.clientItemId,
+      type: "text",
+      textContent: requestedItem.text,
+      processingState: "ready",
+      inboxState: "inbox",
+      createdAt: receivedAt,
+      updatedAt: receivedAt,
+    };
+
+    transaction.insert(schema.captureBatches).values(batch).run();
+    transaction.insert(schema.captureItems).values(item).run();
+
+    return captureResponse(batch, item, "created");
+  });
+}
+
+interface CaptureCursorValue {
+  receivedAt: string;
+  id: string;
+}
+
+export class InvalidCaptureCursorError extends Error {
+  constructor() {
+    super("Capture cursor is invalid");
+    this.name = "InvalidCaptureCursorError";
+  }
+}
+
+function encodeCaptureCursor(value: CaptureCursorValue) {
+  return Buffer.from(JSON.stringify(value)).toString("base64url");
+}
+
+function decodeCaptureCursor(cursor: string): CaptureCursorValue {
+  try {
+    const value = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as unknown;
+    if (
+      !value ||
+      typeof value !== "object" ||
+      typeof (value as CaptureCursorValue).receivedAt !== "string" ||
+      typeof (value as CaptureCursorValue).id !== "string"
+    ) {
+      throw new InvalidCaptureCursorError();
+    }
+    return value as CaptureCursorValue;
+  } catch (error) {
+    if (error instanceof InvalidCaptureCursorError) throw error;
+    throw new InvalidCaptureCursorError();
+  }
+}
+
+export function listTextCaptures(
+  database: CatchboxDatabase,
+  userId: string,
+  options: { cursor?: string; limit?: number } = {},
+): CaptureListResponse {
+  const limit = options.limit ?? 50;
+  const cursor = options.cursor ? decodeCaptureCursor(options.cursor) : undefined;
+  const beforeCursor = cursor
+    ? or(
+        lt(schema.captureBatches.receivedAt, cursor.receivedAt),
+        and(
+          eq(schema.captureBatches.receivedAt, cursor.receivedAt),
+          lt(schema.captureItems.id, cursor.id),
+        ),
+      )
+    : undefined;
+
+  const rows = database.orm
+    .select({
+      id: schema.captureItems.id,
+      batchId: schema.captureItems.batchId,
+      clientItemId: schema.captureItems.clientItemId,
+      type: schema.captureItems.type,
+      text: schema.captureItems.textContent,
+      state: schema.captureItems.processingState,
+      capturedAt: schema.captureBatches.capturedAt,
+      receivedAt: schema.captureBatches.receivedAt,
+    })
+    .from(schema.captureItems)
+    .innerJoin(schema.captureBatches, eq(schema.captureItems.batchId, schema.captureBatches.id))
+    .where(
+      beforeCursor
+        ? and(eq(schema.captureItems.userId, userId), beforeCursor)
+        : eq(schema.captureItems.userId, userId),
+    )
+    .orderBy(desc(schema.captureBatches.receivedAt), desc(schema.captureItems.id))
+    .limit(limit + 1)
+    .all();
+
+  const hasNextPage = rows.length > limit;
+  const captures = rows.slice(0, limit);
+  const finalCapture = captures.at(-1);
+
+  return {
+    captures,
+    nextCursor:
+      hasNextPage && finalCapture
+        ? encodeCaptureCursor({ receivedAt: finalCapture.receivedAt, id: finalCapture.id })
+        : null,
+  };
 }
 
 export { schema };

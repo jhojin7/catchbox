@@ -9,8 +9,10 @@ import {
   createBrowserSession,
   findLocalAccountByUsername,
   getDatabaseHealth,
+  listTextCaptures,
   openDatabase,
   runMigrations,
+  saveTextCaptureBatch,
 } from "./index";
 
 const temporaryDirectories: string[] = [];
@@ -51,11 +53,28 @@ describe("local account persistence", () => {
     database.close();
   });
 
-  test("opens a copied migrated database with its account intact", async () => {
+  test("opens a copied migrated database with its account and text capture intact", async () => {
     const sourceDirectory = isolatedDataDirectory();
     const source = openDatabase(sourceDirectory);
     runMigrations(source);
     await bootstrapLocalAccount(source, "operator", "a-strong-test-passphrase");
+    const sourceAccount = findLocalAccountByUsername(source, "operator")!;
+    saveTextCaptureBatch(
+      source,
+      sourceAccount.id,
+      {
+        clientBatchId: "79d34d4b-662f-4d7b-95bc-a2cb509872a8",
+        capturedAt: "2026-07-18T08:15:30.000Z",
+        items: [
+          {
+            clientItemId: "f427a1f5-c2e3-4cd9-b9b0-64585fac9206",
+            type: "text",
+            text: "Preserve this capture",
+          },
+        ],
+      },
+      new Date("2026-07-18T08:15:31.000Z"),
+    );
     source.close();
 
     const restoredDirectory = isolatedDataDirectory();
@@ -68,6 +87,18 @@ describe("local account persistence", () => {
       writable: true,
     });
     expect(findLocalAccountByUsername(restored, "operator")?.username).toBe("operator");
+    expect(listTextCaptures(restored, sourceAccount.id).captures).toEqual([
+      {
+        id: expect.any(String),
+        batchId: expect.any(String),
+        clientItemId: "f427a1f5-c2e3-4cd9-b9b0-64585fac9206",
+        type: "text",
+        text: "Preserve this capture",
+        state: "ready",
+        capturedAt: "2026-07-18T08:15:30.000Z",
+        receivedAt: "2026-07-18T08:15:31.000Z",
+      },
+    ]);
 
     restored.close();
   });

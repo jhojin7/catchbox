@@ -74,14 +74,16 @@ The implementation will proceed in small vertical slices:
 7. Android and iOS share integrations.
 8. ARM64 deployment, export, operations documentation, and recovery drills.
 
-## Local sign-in quick start
+## Local quick-capture start
 
-Catchbox currently provides the first vertical slice: validated startup configuration, the single
-local account, health checks, and a protected PWA shell that is installable when Catchbox is served
-from a browser-supported secure context (including localhost for development). The service worker
-caches only the static shell needed to open the login surface without a network response. Durable
-offline capture, pending-work display, and reconnect synchronization remain part of the later
-offline-capture slice and are not provided here.
+Catchbox currently provides validated startup configuration, the single local account, health
+checks, online text quick-capture, and a chronological protected PWA inbox. The shell is installable
+when Catchbox is served from a browser-supported secure context (including localhost for
+development). The service worker caches only the static shell needed to open the login surface
+without a network response. Text quick-capture currently requires a live connection: the PWA does
+not yet persist a pending capture locally or retry it after reconnecting. Durable offline capture,
+pending-work display, and reconnect synchronization are assigned to
+[issue #4](https://github.com/jhojin7/catchbox/issues/4) and are not provided by this slice.
 
 1. Install the pinned Bun workspace dependencies and create local configuration:
 
@@ -125,6 +127,8 @@ bun run build
 ## Documentation
 
 - [Implementation plan](PLAN.md) — product scope, architecture, interfaces, and delivery sequence.
+- [HTTP capture API](docs/http-api.md) — authenticated script requests, responses, idempotency,
+  cursor pagination, and errors.
 - [Catchbox v1 specification](https://github.com/jhojin7/catchbox/issues/1) — implementation-ready behavior, user stories, decisions, and acceptance strategy.
 - [Agent guide](AGENTS.md) — repository invariants, conventions, and quality gates for contributors and coding agents.
 

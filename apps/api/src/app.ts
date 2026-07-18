@@ -7,10 +7,17 @@ import {
   countLocalAccounts,
   createBrowserSession,
   getDatabaseHealth,
+  InvalidCaptureCursorError,
+  listTextCaptures,
+  saveTextCaptureBatch,
   verifyLocalAccountPassword,
   type CatchboxDatabase,
 } from "@catchbox/db";
 import {
+  captureBatchRequestSchema,
+  captureBatchResponseSchema,
+  captureListQuerySchema,
+  captureListResponseSchema,
   currentAccountSchema,
   errorEnvelopeSchema,
   healthResponseSchema,
@@ -143,21 +150,75 @@ export function createApp({
     return currentAccountResponse(response, account);
   });
 
-  app.get("/api/v1/auth/me", (request, response) => {
+  function authenticatedAccount(request: Request, response: Response) {
     const token = readCookie(request, SESSION_COOKIE);
     const account = token
       ? authenticateBrowserSession(database, token, config.sessionIdleSeconds)
       : undefined;
-
     if (!account) {
-      return errorResponse(response, 401, {
+      errorResponse(response, 401, {
         code: "AUTHENTICATION_REQUIRED",
         message: "Sign in to continue",
       });
     }
+    return account;
+  }
+
+  app.get("/api/v1/auth/me", (request, response) => {
+    const account = authenticatedAccount(request, response);
+    if (!account) return;
 
     response.setHeader("cache-control", "no-store");
     return currentAccountResponse(response, account);
+  });
+
+  app.post("/api/v1/capture-batches", (request, response) => {
+    const account = authenticatedAccount(request, response);
+    if (!account) return;
+
+    const parsed = captureBatchRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return errorResponse(response, 400, {
+        code: "INVALID_REQUEST",
+        message: "Capture batch request is invalid",
+      });
+    }
+
+    const result = saveTextCaptureBatch(database, account.id, parsed.data);
+    response.setHeader("cache-control", "no-store");
+    return validatedJson(
+      response,
+      result.batch.result === "created" ? 201 : 200,
+      captureBatchResponseSchema,
+      result,
+    );
+  });
+
+  app.get("/api/v1/captures", (request, response) => {
+    const account = authenticatedAccount(request, response);
+    if (!account) return;
+
+    const query = captureListQuerySchema.safeParse(request.query);
+    if (!query.success) {
+      return errorResponse(response, 400, {
+        code: "INVALID_REQUEST",
+        message: "Capture list query is invalid",
+      });
+    }
+
+    try {
+      const result = listTextCaptures(database, account.id, query.data);
+      response.setHeader("cache-control", "no-store");
+      return validatedJson(response, 200, captureListResponseSchema, result);
+    } catch (error) {
+      if (error instanceof InvalidCaptureCursorError) {
+        return errorResponse(response, 400, {
+          code: "INVALID_REQUEST",
+          message: error.message,
+        });
+      }
+      throw error;
+    }
   });
 
   const webIndexPath = `${webDistPath}/index.html`;
@@ -184,8 +245,17 @@ export function createApp({
   );
 
   app.use((error: unknown, _request: Request, response: Response, _next: unknown) => {
+    const requestErrorType =
+      error && typeof error === "object" && "type" in error ? error.type : undefined;
+    if (requestErrorType === "entity.parse.failed" || requestErrorType === "entity.too.large") {
+      logger.warn({ event: "invalid_request", reason: requestErrorType });
+      return errorResponse(response, 400, {
+        code: "INVALID_REQUEST",
+        message: "JSON request body is invalid",
+      });
+    }
     logger.error({ event: "request_error", error: error instanceof Error ? error.message : "unknown" });
-    errorResponse(response, 500, { code: "INTERNAL_ERROR", message: "Unexpected server error" });
+    return errorResponse(response, 500, { code: "INTERNAL_ERROR", message: "Unexpected server error" });
   });
 
   return app;

@@ -8,6 +8,13 @@
       "when": 1784381523038,
       "tag": "0000_orange_sinister_six",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1784383132422,
+      "tag": "0001_complete_silver_centurion",
+      "breakpoints": true
     }
   ]
 }

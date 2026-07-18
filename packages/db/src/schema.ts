@@ -42,5 +42,53 @@ export const sessions = sqliteTable(
   ],
 );
 
+export const captureBatches = sqliteTable(
+  "capture_batches",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    clientBatchId: text("client_batch_id").notNull(),
+    sourcePlatform: text("source_platform"),
+    sourceApp: text("source_app"),
+    capturedAt: text("captured_at").notNull(),
+    receivedAt: text("received_at").notNull(),
+  },
+  (table) => [
+    uniqueIndex("capture_batches_user_client_id_unique").on(table.userId, table.clientBatchId),
+    index("capture_batches_user_received_index").on(table.userId, table.receivedAt, table.id),
+  ],
+);
+
+export const captureItems = sqliteTable(
+  "capture_items",
+  {
+    id: text("id").primaryKey(),
+    batchId: text("batch_id")
+      .notNull()
+      .references(() => captureBatches.id, { onDelete: "cascade" }),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    clientItemId: text("client_item_id").notNull(),
+    type: text("type").$type<"text">().notNull(),
+    textContent: text("text_content").notNull(),
+    processingState: text("processing_state").$type<"ready">().notNull(),
+    inboxState: text("inbox_state").$type<"inbox">().notNull(),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [
+    uniqueIndex("capture_items_user_client_id_unique").on(table.userId, table.clientItemId),
+    index("capture_items_batch_id_index").on(table.batchId),
+    check("capture_items_type_check", sql`${table.type} = 'text'`),
+    check("capture_items_processing_state_check", sql`${table.processingState} = 'ready'`),
+    check("capture_items_inbox_state_check", sql`${table.inboxState} = 'inbox'`),
+  ],
+);
+
 export type UserRow = typeof users.$inferSelect;
 export type SessionRow = typeof sessions.$inferSelect;
+export type CaptureBatchRow = typeof captureBatches.$inferSelect;
+export type CaptureItemRow = typeof captureItems.$inferSelect;

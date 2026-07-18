@@ -6,9 +6,12 @@ import {
   type ErrorCode,
   type LoginRequest,
 } from "@catchbox/shared";
-
-const INVALID_RESPONSE_MESSAGE = "Catchbox returned an invalid response";
-type AuthenticationFetcher = (input: string, init?: RequestInit) => Promise<Response>;
+import {
+  readValidatedJson,
+  throwApiError,
+  throwValidatedApiError,
+  type HttpFetcher,
+} from "./http-api";
 
 export class AuthenticationApiError extends Error {
   constructor(
@@ -20,38 +23,25 @@ export class AuthenticationApiError extends Error {
   }
 }
 
-async function readCurrentAccount(response: Response) {
-  try {
-    return currentAccountSchema.parse(await response.json());
-  } catch {
-    throw new Error(INVALID_RESPONSE_MESSAGE);
-  }
-}
-
-async function readError(response: Response) {
-  try {
-    return errorEnvelopeSchema.parse(await response.json());
-  } catch {
-    throw new Error(INVALID_RESPONSE_MESSAGE);
-  }
-}
-
 export async function fetchCurrentAccount(
-  fetcher: AuthenticationFetcher = fetch,
+  fetcher: HttpFetcher = fetch,
 ): Promise<CurrentAccount | undefined> {
   const response = await fetcher("/api/v1/auth/me", {
     headers: { accept: "application/json" },
   });
-  if (response.ok) return readCurrentAccount(response);
+  if (response.ok) return readValidatedJson(response, currentAccountSchema);
 
-  const error = await readError(response);
+  const error = await readValidatedJson(response, errorEnvelopeSchema);
   if (response.status === 401 && error.code === "AUTHENTICATION_REQUIRED") return undefined;
-  throw new AuthenticationApiError(error.message, error.code);
+  return throwApiError(
+    error,
+    (message, code) => new AuthenticationApiError(message, code),
+  );
 }
 
 export async function loginWithPassword(
   credentials: LoginRequest,
-  fetcher: AuthenticationFetcher = fetch,
+  fetcher: HttpFetcher = fetch,
 ): Promise<CurrentAccount> {
   const request = loginRequestSchema.parse(credentials);
   const response = await fetcher("/api/v1/auth/login", {
@@ -59,8 +49,10 @@ export async function loginWithPassword(
     headers: { "content-type": "application/json", accept: "application/json" },
     body: JSON.stringify(request),
   });
-  if (response.ok) return readCurrentAccount(response);
+  if (response.ok) return readValidatedJson(response, currentAccountSchema);
 
-  const error = await readError(response);
-  throw new AuthenticationApiError(error.message, error.code);
+  return throwValidatedApiError(
+    response,
+    (message, code) => new AuthenticationApiError(message, code),
+  );
 }
