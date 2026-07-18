@@ -6,9 +6,12 @@ import {
   type CaptureBatchResponse,
   type CaptureListResponse,
   type CaptureWriteResult,
+  type OutboxStatusRequest,
+  type OutboxStatusResponse,
+  type OutboxRetryRequest,
   type SessionClientKind,
 } from "@catchbox/shared";
-import { and, count, desc, eq, isNull, lt, or } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray, isNull, lt, or } from "drizzle-orm";
 import { drizzle, type BunSQLiteDatabase } from "drizzle-orm/bun-sqlite";
 import { migrate } from "drizzle-orm/bun-sqlite/migrator";
 import { hashPassword } from "./password";
@@ -267,7 +270,7 @@ export async function changeLocalAccountPassword(
 
 function captureResponse(
   batch: schema.CaptureBatchRow,
-  item: schema.CaptureItemRow,
+  items: schema.CaptureItemRow[],
   result: CaptureWriteResult,
 ): CaptureBatchResponse {
   return {
@@ -278,15 +281,56 @@ function captureResponse(
       capturedAt: batch.capturedAt,
       receivedAt: batch.receivedAt,
     },
-    items: [
-      {
-        id: item.id,
-        clientItemId: item.clientItemId,
-        result,
-        type: "text",
-        state: "ready",
-      },
-    ],
+    items: items.map((item) => captureItemResponse(item, result)),
+  };
+}
+
+function newCaptureItemRow(
+  batchId: string,
+  userId: string,
+  requestedItem: CaptureBatchRequest["items"][number],
+  timestamp: string,
+): schema.CaptureItemRow {
+  return {
+    id: crypto.randomUUID(),
+    batchId,
+    userId,
+    clientItemId: requestedItem.clientItemId,
+    type: "text",
+    textContent: requestedItem.text,
+    processingState: "ready",
+    inboxState: "inbox",
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+}
+
+function newCaptureBatchRow(
+  userId: string,
+  request: CaptureBatchRequest,
+  timestamp: string,
+): schema.CaptureBatchRow {
+  return {
+    id: crypto.randomUUID(),
+    userId,
+    clientBatchId: request.clientBatchId,
+    sourcePlatform: request.source?.platform ?? null,
+    sourceApp: request.source?.app ?? null,
+    capturedAt: request.capturedAt,
+    receivedAt: timestamp,
+  };
+}
+
+function captureItemResponse(
+  item: schema.CaptureItemRow,
+  result: CaptureWriteResult,
+): CaptureBatchResponse["items"][number] {
+  return {
+    id: item.id,
+    clientItemId: item.clientItemId,
+    result,
+    type: "text",
+    state: "ready",
   };
 }
 
@@ -309,23 +353,26 @@ export function saveTextCaptureBatch(
       .get();
 
     if (matchingBatch) {
-      const item = transaction
+      const items = transaction
         .select()
         .from(schema.captureItems)
         .where(eq(schema.captureItems.batchId, matchingBatch.id))
-        .get();
-      if (!item) throw new Error("Stored capture batch has no item");
-      return captureResponse(matchingBatch, item, "existing");
+        .orderBy(asc(schema.captureItems.createdAt), asc(schema.captureItems.id))
+        .all();
+      if (items.length === 0) throw new Error("Stored capture batch has no item");
+      return captureResponse(matchingBatch, items, "existing");
     }
 
-    const requestedItem = request.items[0];
     const matchingItem = transaction
       .select()
       .from(schema.captureItems)
       .where(
         and(
           eq(schema.captureItems.userId, userId),
-          eq(schema.captureItems.clientItemId, requestedItem.clientItemId),
+          inArray(
+            schema.captureItems.clientItemId,
+            request.items.map((item) => item.clientItemId),
+          ),
         ),
       )
       .get();
@@ -337,37 +384,168 @@ export function saveTextCaptureBatch(
         .where(eq(schema.captureBatches.id, matchingItem.batchId))
         .get();
       if (!batch) throw new Error("Stored capture item has no batch");
-      return captureResponse(batch, matchingItem, "existing");
+      const items = transaction
+        .select()
+        .from(schema.captureItems)
+        .where(eq(schema.captureItems.batchId, batch.id))
+        .orderBy(asc(schema.captureItems.createdAt), asc(schema.captureItems.id))
+        .all();
+      return captureResponse(batch, items, "existing");
     }
 
     const receivedAt = now.toISOString();
-    const batch: schema.CaptureBatchRow = {
-      id: crypto.randomUUID(),
-      userId,
-      clientBatchId: request.clientBatchId,
-      sourcePlatform: request.source?.platform ?? null,
-      sourceApp: request.source?.app ?? null,
-      capturedAt: request.capturedAt,
-      receivedAt,
-    };
-    const item: schema.CaptureItemRow = {
-      id: crypto.randomUUID(),
-      batchId: batch.id,
-      userId,
-      clientItemId: requestedItem.clientItemId,
-      type: "text",
-      textContent: requestedItem.text,
-      processingState: "ready",
-      inboxState: "inbox",
-      createdAt: receivedAt,
-      updatedAt: receivedAt,
-    };
+    const batch = newCaptureBatchRow(userId, request, receivedAt);
+    const items = request.items.map((requestedItem) =>
+      newCaptureItemRow(batch.id, userId, requestedItem, receivedAt),
+    );
 
     transaction.insert(schema.captureBatches).values(batch).run();
-    transaction.insert(schema.captureItems).values(item).run();
+    transaction.insert(schema.captureItems).values(items).run();
 
-    return captureResponse(batch, item, "created");
+    return captureResponse(batch, items, "created");
   });
+}
+
+export function retryTextCaptureItems(
+  database: CatchboxDatabase,
+  userId: string,
+  request: OutboxRetryRequest,
+  now = new Date(),
+): CaptureBatchResponse {
+  return database.orm.transaction((transaction) => {
+    let batch = transaction
+      .select()
+      .from(schema.captureBatches)
+      .where(
+        and(
+          eq(schema.captureBatches.userId, userId),
+          eq(schema.captureBatches.clientBatchId, request.batch.clientBatchId),
+        ),
+      )
+      .get();
+    const selectedIds = new Set(request.clientItemIds);
+    const requestedItems = request.batch.items.filter((item) =>
+      selectedIds.has(item.clientItemId),
+    );
+    const existingItems = transaction
+      .select()
+      .from(schema.captureItems)
+      .where(
+        and(
+          eq(schema.captureItems.userId, userId),
+          inArray(schema.captureItems.clientItemId, request.clientItemIds),
+        ),
+      )
+      .all();
+    const existingByClientId = new Map(
+      existingItems.map((item) => [item.clientItemId, item]),
+    );
+    const receivedAt = now.toISOString();
+    const batchResult: CaptureWriteResult = batch ? "existing" : "created";
+    if (!batch) {
+      batch = newCaptureBatchRow(userId, request.batch, receivedAt);
+      transaction.insert(schema.captureBatches).values(batch).run();
+    }
+
+    const results: CaptureBatchResponse["items"] = [];
+    for (const requestedItem of requestedItems) {
+      let item = existingByClientId.get(requestedItem.clientItemId);
+      let result: CaptureWriteResult = "existing";
+      if (item && item.batchId !== batch.id) {
+        throw new Error("Stored capture item belongs to another client batch");
+      }
+      if (!item) {
+        result = "created";
+        item = newCaptureItemRow(batch.id, userId, requestedItem, receivedAt);
+        transaction.insert(schema.captureItems).values(item).run();
+      }
+      results.push(captureItemResponse(item, result));
+    }
+
+    return {
+      batch: {
+        id: batch.id,
+        clientBatchId: batch.clientBatchId,
+        result: batchResult,
+        capturedAt: batch.capturedAt,
+        receivedAt: batch.receivedAt,
+      },
+      items: results,
+    };
+  });
+}
+
+export function reconcileCaptureIdentities(
+  database: CatchboxDatabase,
+  userId: string,
+  request: OutboxStatusRequest,
+): OutboxStatusResponse {
+  const matchedBatchIds = new Set<string>();
+
+  if (request.clientBatchIds.length > 0) {
+    const batches = database.orm
+      .select({ id: schema.captureBatches.id })
+      .from(schema.captureBatches)
+      .where(
+        and(
+          eq(schema.captureBatches.userId, userId),
+          inArray(schema.captureBatches.clientBatchId, request.clientBatchIds),
+        ),
+      )
+      .all();
+    for (const batch of batches) matchedBatchIds.add(batch.id);
+  }
+
+  if (request.clientItemIds.length > 0) {
+    const items = database.orm
+      .select({ batchId: schema.captureItems.batchId })
+      .from(schema.captureItems)
+      .where(
+        and(
+          eq(schema.captureItems.userId, userId),
+          inArray(schema.captureItems.clientItemId, request.clientItemIds),
+        ),
+      )
+      .all();
+    for (const item of items) matchedBatchIds.add(item.batchId);
+  }
+
+  if (matchedBatchIds.size === 0) return { batches: [] };
+
+  const rows = database.orm
+    .select({ batch: schema.captureBatches, item: schema.captureItems })
+    .from(schema.captureBatches)
+    .innerJoin(schema.captureItems, eq(schema.captureItems.batchId, schema.captureBatches.id))
+    .where(
+      and(
+        eq(schema.captureBatches.userId, userId),
+        inArray(schema.captureBatches.id, [...matchedBatchIds]),
+      ),
+    )
+    .all();
+  const batches = new Map<string, OutboxStatusResponse["batches"][number]>();
+  for (const { batch, item } of rows) {
+    const reconciled = batches.get(batch.id) ?? {
+      id: batch.id,
+      clientBatchId: batch.clientBatchId,
+      capturedAt: batch.capturedAt,
+      receivedAt: batch.receivedAt,
+      items: [],
+    };
+    reconciled.items.push({
+      id: item.id,
+      clientItemId: item.clientItemId,
+      type: item.type,
+      state: item.processingState,
+    });
+    batches.set(batch.id, reconciled);
+  }
+
+  return {
+    batches: [...batches.values()].sort((left, right) =>
+      left.clientBatchId.localeCompare(right.clientBatchId),
+    ),
+  };
 }
 
 interface CaptureCursorValue {

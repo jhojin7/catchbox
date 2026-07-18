@@ -88,9 +88,22 @@ export const captureBatchRequestSchema = z
       })
       .strict()
       .optional(),
-    items: z.tuple([textCaptureItemRequestSchema]),
+    items: z.array(textCaptureItemRequestSchema).min(1).max(100),
   })
-  .strict();
+  .strict()
+  .superRefine(({ items }, context) => {
+    const seen = new Set<string>();
+    for (const item of items) {
+      if (seen.has(item.clientItemId)) {
+        context.addIssue({
+          code: "custom",
+          message: "Client item IDs must be unique within a batch",
+          path: ["items"],
+        });
+      }
+      seen.add(item.clientItemId);
+    }
+  });
 
 export const captureWriteResultSchema = z.enum(["created", "existing"]);
 export const captureItemStateSchema = z.literal("ready");
@@ -106,7 +119,7 @@ export const captureBatchResponseSchema = z
         receivedAt: z.iso.datetime({ offset: true }),
       })
       .strict(),
-    items: z.tuple([
+    items: z.array(
       z
         .object({
           id: z.uuid(),
@@ -116,7 +129,7 @@ export const captureBatchResponseSchema = z
           state: captureItemStateSchema,
         })
         .strict(),
-    ]),
+    ).min(1).max(100),
   })
   .strict();
 
@@ -140,6 +153,63 @@ export const captureListResponseSchema = z
   })
   .strict();
 
+export const outboxStatusRequestSchema = z
+  .object({
+    clientBatchIds: z.array(z.uuid()).max(100),
+    clientItemIds: z.array(z.uuid()).max(100),
+  })
+  .strict()
+  .refine(
+    ({ clientBatchIds, clientItemIds }) => clientBatchIds.length + clientItemIds.length > 0,
+    { message: "At least one client identity is required" },
+  );
+
+export const outboxRetryRequestSchema = z
+  .object({
+    batch: captureBatchRequestSchema,
+    clientItemIds: z.array(z.uuid()).min(1).max(100),
+  })
+  .strict()
+  .superRefine(({ batch, clientItemIds }, context) => {
+    const requestIds = new Set(batch.items.map((item) => item.clientItemId));
+    const selectedIds = new Set<string>();
+    for (const clientItemId of clientItemIds) {
+      if (!requestIds.has(clientItemId) || selectedIds.has(clientItemId)) {
+        context.addIssue({
+          code: "custom",
+          message: "Retry item IDs must be unique members of the batch request",
+          path: ["clientItemIds"],
+        });
+      }
+      selectedIds.add(clientItemId);
+    }
+  });
+
+const reconciledCaptureItemSchema = z
+  .object({
+    id: z.uuid(),
+    clientItemId: z.uuid(),
+    type: z.literal("text"),
+    state: captureItemStateSchema,
+  })
+  .strict();
+
+export const outboxStatusResponseSchema = z
+  .object({
+    batches: z.array(
+      z
+        .object({
+          id: z.uuid(),
+          clientBatchId: z.uuid(),
+          capturedAt: z.iso.datetime({ offset: true }),
+          receivedAt: z.iso.datetime({ offset: true }),
+          items: z.array(reconciledCaptureItemSchema),
+        })
+        .strict(),
+    ),
+  })
+  .strict();
+
 export type LoginRequest = z.infer<typeof loginRequestSchema>;
 export type ChangePasswordRequest = z.infer<typeof changePasswordRequestSchema>;
 export type ErrorEnvelope = z.infer<typeof errorEnvelopeSchema>;
@@ -156,3 +226,6 @@ export type CaptureWriteResult = z.infer<typeof captureWriteResultSchema>;
 export type CaptureBatchResponse = z.infer<typeof captureBatchResponseSchema>;
 export type CaptureListItem = z.infer<typeof captureListItemSchema>;
 export type CaptureListResponse = z.infer<typeof captureListResponseSchema>;
+export type OutboxStatusRequest = z.infer<typeof outboxStatusRequestSchema>;
+export type OutboxStatusResponse = z.infer<typeof outboxStatusResponseSchema>;
+export type OutboxRetryRequest = z.infer<typeof outboxRetryRequestSchema>;

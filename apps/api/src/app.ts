@@ -10,6 +10,8 @@ import {
   getDatabaseHealth,
   InvalidCaptureCursorError,
   listTextCaptures,
+  reconcileCaptureIdentities,
+  retryTextCaptureItems,
   revokeCredential,
   saveTextCaptureBatch,
   verifyLocalAccountPassword,
@@ -25,6 +27,9 @@ import {
   errorEnvelopeSchema,
   healthResponseSchema,
   loginRequestSchema,
+  outboxStatusRequestSchema,
+  outboxStatusResponseSchema,
+  outboxRetryRequestSchema,
   sessionClientKinds,
   tokenLoginResponseSchema,
   type CurrentAccount,
@@ -347,6 +352,42 @@ export function createApp({
       }
       throw error;
     }
+  });
+
+  app.post("/api/v1/outbox/status", requireAuthentication, (request, response) => {
+    const parsed = outboxStatusRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return errorResponse(response, 400, {
+        code: "INVALID_REQUEST",
+        message: "Outbox status request is invalid",
+      });
+    }
+
+    const { account } = authenticatedRequest(response);
+    return validatedJson(
+      response,
+      200,
+      outboxStatusResponseSchema,
+      reconcileCaptureIdentities(database, account.id, parsed.data),
+    );
+  });
+
+  app.post("/api/v1/outbox/retry-items", requireAuthentication, (request, response) => {
+    const parsed = outboxRetryRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return errorResponse(response, 400, {
+        code: "INVALID_REQUEST",
+        message: "Outbox item retry request is invalid",
+      });
+    }
+    const { account } = authenticatedRequest(response);
+    const result = retryTextCaptureItems(database, account.id, parsed.data, clock());
+    return validatedJson(
+      response,
+      result.items.some((item) => item.result === "created") ? 201 : 200,
+      captureBatchResponseSchema,
+      result,
+    );
   });
 
   const webIndexPath = `${webDistPath}/index.html`;

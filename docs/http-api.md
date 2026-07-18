@@ -12,6 +12,11 @@ responses clear it while retaining that account's outbox. Remote session invalid
 observed by a client that remains continuously offline, so the marker is cleared when that client
 next receives an unauthenticated server response.
 
+The PWA outbox stores attempt count, eligibility time, last attempt, error code, and actionable
+detail alongside the complete request. Retryable failures use bounded exponential backoff. Invalid
+requests become failed entries with explicit Retry and Discard actions; discard removes only the
+local failed entry and never calls a server delete route.
+
 The examples assume `CATCHBOX_URL` contains the Catchbox origin, such as
 `http://catchbox.home:3000`. Keep the cookie jar private and remove it when the script finishes.
 
@@ -34,8 +39,8 @@ Successful login returns the public account identity. Capture requests send the 
 
 Clients generate and retain one UUID for the batch and one UUID for the item before submission.
 `capturedAt` is an RFC 3339 timestamp with an offset. This online slice accepts exactly one non-empty
-text item per JSON batch; URLs, attachments, multipart requests, and offline retry are not part of
-the endpoint itself.
+one or more non-empty text items per JSON batch; URLs, attachments, multipart requests, and offline
+retry are not part of the endpoint itself.
 
 ```sh
 curl --fail-with-body \
@@ -100,6 +105,33 @@ Idempotency is scoped to the authenticated user:
 
 Keep both client UUIDs until a response is known. A script may safely retry the same request after
 an ambiguous connection failure.
+
+## Reconcile an ambiguous submission
+
+Before resubmitting an attempted batch, clients ask which stable identities the authenticated
+account already owns:
+
+```sh
+curl --fail-with-body \
+  --cookie ./catchbox-cookies.txt \
+  --header 'content-type: application/json' \
+  --data '{
+    "clientBatchIds":["79d34d4b-662f-4d7b-95bc-a2cb509872a8"],
+    "clientItemIds":["f427a1f5-c2e3-4cd9-b9b0-64585fac9206"]
+  }' \
+  "$CATCHBOX_URL/api/v1/outbox/status"
+```
+
+The response contains only identities already known for the authenticated account. Unknown IDs are
+omitted. Each known batch includes its server ID, capture and receipt timestamps, and known item
+outcomes. The client can therefore mark a committed capture synced after a lost response without
+submitting it again. Both arrays accept at most 100 UUIDs, and at least one identity is required.
+
+When only selected failed members of a retained batch are eligible, the PWA posts the complete
+stable batch envelope plus those `clientItemIds` to `/api/v1/outbox/retry-items`. The authenticated
+server creates or reuses the stable batch and persists only the selected items. Later retries can
+append other stable members without changing the original batch or item identifiers; repeating the
+same selected item is idempotent.
 
 ## List the inbox
 

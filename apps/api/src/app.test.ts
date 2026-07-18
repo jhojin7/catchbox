@@ -18,6 +18,7 @@ import {
   currentAccountSchema,
   errorEnvelopeSchema,
   healthResponseSchema,
+  outboxStatusResponseSchema,
   tokenLoginResponseSchema,
   type SessionClientKind,
 } from "@catchbox/shared";
@@ -501,6 +502,164 @@ describe("online text capture", () => {
     });
   });
 
+  test("persists multiple text items as independently identified members of one batch", async () => {
+    const cookie = sessionCookie(await login());
+    const clientBatchId = "79d34d4b-662f-4d7b-95bc-a2cb509872a8";
+    const items = [
+      {
+        clientItemId: "f427a1f5-c2e3-4cd9-b9b0-64585fac9206",
+        type: "text",
+        text: "First batch member",
+      },
+      {
+        clientItemId: "e9e253bc-2244-4931-a713-1401f84f7b25",
+        type: "text",
+        text: "Second batch member",
+      },
+    ];
+    const created = await fetch(`${baseUrl}/api/v1/capture-batches`, {
+      method: "POST",
+      headers: { cookie, "content-type": "application/json" },
+      body: JSON.stringify({
+        clientBatchId,
+        capturedAt: "2026-07-18T08:15:30.000Z",
+        items,
+      }),
+    });
+    const result = captureBatchResponseSchema.parse(await created.json());
+    const inbox = captureListResponseSchema.parse(
+      await (await fetch(`${baseUrl}/api/v1/captures`, { headers: { cookie } })).json(),
+    );
+
+    expect(created.status).toBe(201);
+    expect(result.items.map((item) => item.clientItemId).sort()).toEqual(
+      items.map((item) => item.clientItemId).sort(),
+    );
+    expect(inbox.captures).toHaveLength(2);
+    expect(new Set(inbox.captures.map((item) => item.batchId))).toEqual(
+      new Set([result.batch.id]),
+    );
+  });
+
+  test("retries selected items independently into one stable client batch", async () => {
+    const cookie = sessionCookie(await login());
+    const batch = {
+      clientBatchId: "79d34d4b-662f-4d7b-95bc-a2cb509872a8",
+      capturedAt: "2026-07-18T08:15:30.000Z",
+      items: [
+        {
+          clientItemId: "f427a1f5-c2e3-4cd9-b9b0-64585fac9206",
+          type: "text",
+          text: "Retry first",
+        },
+        {
+          clientItemId: "e9e253bc-2244-4931-a713-1401f84f7b25",
+          type: "text",
+          text: "Retry second",
+        },
+      ],
+    };
+    const retry = (clientItemId: string) =>
+      fetch(`${baseUrl}/api/v1/outbox/retry-items`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ batch, clientItemIds: [clientItemId] }),
+      });
+
+    const first = await retry(batch.items[0].clientItemId);
+    const second = await retry(batch.items[1].clientItemId);
+    const firstResult = captureBatchResponseSchema.parse(await first.json());
+    const secondResult = captureBatchResponseSchema.parse(await second.json());
+    const inbox = captureListResponseSchema.parse(
+      await (await fetch(`${baseUrl}/api/v1/captures`, { headers: { cookie } })).json(),
+    );
+
+    expect(first.status).toBe(201);
+    expect(second.status).toBe(201);
+    expect(secondResult.batch.id).toBe(firstResult.batch.id);
+    expect(firstResult.items.map((item) => item.clientItemId)).toEqual([
+      batch.items[0].clientItemId,
+    ]);
+    expect(secondResult.items.map((item) => item.clientItemId)).toEqual([
+      batch.items[1].clientItemId,
+    ]);
+    expect(inbox.captures).toHaveLength(2);
+  });
+
+  test("reconciles known stable identities through the authenticated outbox interface", async () => {
+    const cookie = sessionCookie(await login());
+    const request = {
+      clientBatchId: "79d34d4b-662f-4d7b-95bc-a2cb509872a8",
+      capturedAt: "2026-07-18T08:15:30.000Z",
+      items: [
+        {
+          clientItemId: "f427a1f5-c2e3-4cd9-b9b0-64585fac9206",
+          type: "text",
+          text: "Recover an ambiguous response",
+        },
+      ],
+    };
+    const created = captureBatchResponseSchema.parse(
+      await (
+        await fetch(`${baseUrl}/api/v1/capture-batches`, {
+          method: "POST",
+          headers: { cookie, "content-type": "application/json" },
+          body: JSON.stringify(request),
+        })
+      ).json(),
+    );
+
+    const unauthorized = await fetch(`${baseUrl}/api/v1/outbox/status`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        clientBatchIds: [request.clientBatchId],
+        clientItemIds: [request.items[0].clientItemId],
+      }),
+    });
+    const unauthorizedRetry = await fetch(`${baseUrl}/api/v1/outbox/retry-items`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ batch: request, clientItemIds: [request.items[0].clientItemId] }),
+    });
+    const invalid = await fetch(`${baseUrl}/api/v1/outbox/status`, {
+      method: "POST",
+      headers: { cookie, "content-type": "application/json" },
+      body: JSON.stringify({ clientBatchIds: [], clientItemIds: [] }),
+    });
+    const reconciledResponse = await fetch(`${baseUrl}/api/v1/outbox/status`, {
+      method: "POST",
+      headers: { cookie, "content-type": "application/json" },
+      body: JSON.stringify({
+        clientBatchIds: [request.clientBatchId, crypto.randomUUID()],
+        clientItemIds: [request.items[0].clientItemId, crypto.randomUUID()],
+      }),
+    });
+
+    expect(unauthorized.status).toBe(401);
+    expect(unauthorizedRetry.status).toBe(401);
+    expect(invalid.status).toBe(400);
+    expect(reconciledResponse.status).toBe(200);
+    expect(outboxStatusResponseSchema.parse(await reconciledResponse.json())).toEqual({
+      batches: [
+        {
+          id: created.batch.id,
+          clientBatchId: request.clientBatchId,
+          capturedAt: request.capturedAt,
+          receivedAt: created.batch.receivedAt,
+          items: [
+            {
+              id: created.items[0].id,
+              clientItemId: request.items[0].clientItemId,
+              type: "text",
+              state: "ready",
+            },
+          ],
+        },
+      ],
+    });
+  });
+
   test("returns the original result for duplicate batch and item identities", async () => {
     const cookie = sessionCookie(await login());
     const original = {
@@ -656,7 +815,7 @@ describe("online text capture", () => {
     expect(secondPage.nextCursor).toBeNull();
   });
 
-  test("accepts browser, script, and native credentials across both capture routes", async () => {
+  test("accepts browser, script, and native credentials across all capture routes", async () => {
     const browserCookie = sessionCookie(await login());
     const scriptToken = (await tokenLogin("script")).credential.token;
     const androidToken = (await tokenLogin("android")).credential.token;
@@ -714,10 +873,20 @@ describe("online text capture", () => {
       const response = await fetch(`${baseUrl}/api/v1/captures`, { headers });
       expect(response.status).toBe(200);
       expect(captureListResponseSchema.parse(await response.json()).captures).toHaveLength(3);
+      const status = await fetch(`${baseUrl}/api/v1/outbox/status`, {
+        method: "POST",
+        headers: { ...headers, "content-type": "application/json" },
+        body: JSON.stringify({
+          clientBatchIds: submissions.map((submission) => submission.clientBatchId),
+          clientItemIds: submissions.map((submission) => submission.clientItemId),
+        }),
+      });
+      expect(status.status).toBe(200);
+      expect(outboxStatusResponseSchema.parse(await status.json()).batches).toHaveLength(3);
     }
   });
 
-  test("rejects expired and revoked browser and token credentials on both capture routes", async () => {
+  test("rejects expired and revoked browser and token credentials on all capture routes", async () => {
     const validRequest = {
       clientBatchId: "79d34d4b-662f-4d7b-95bc-a2cb509872a8",
       capturedAt: "2026-07-18T08:15:30.000Z",
@@ -736,8 +905,16 @@ describe("online text capture", () => {
         body: JSON.stringify(validRequest),
       });
       const list = await fetch(`${baseUrl}/api/v1/captures`, { headers });
+      const status = await fetch(`${baseUrl}/api/v1/outbox/status`, {
+        method: "POST",
+        headers: { ...headers, "content-type": "application/json" },
+        body: JSON.stringify({
+          clientBatchIds: [validRequest.clientBatchId],
+          clientItemIds: [validRequest.items[0].clientItemId],
+        }),
+      });
 
-      for (const response of [create, list]) {
+      for (const response of [create, list, status]) {
         expect(response.status).toBe(401);
         expect(errorEnvelopeSchema.parse(await response.json()).code).toBe(
           "AUTHENTICATION_REQUIRED",
@@ -820,6 +997,8 @@ describe("online text capture", () => {
     );
     expect(operatorCreated.status).toBe(201);
     expect(syntheticCreated.status).toBe(201);
+    const operatorCreatedBody = captureBatchResponseSchema.parse(await operatorCreated.json());
+    const syntheticCreatedBody = captureBatchResponseSchema.parse(await syntheticCreated.json());
 
     const operatorInbox = captureListResponseSchema.parse(
       await (
@@ -837,5 +1016,34 @@ describe("online text capture", () => {
     expect(syntheticInbox.captures.map((capture) => capture.text)).toEqual([
       "Synthetic capture",
     ]);
+
+    const statusBody = JSON.stringify({
+      clientBatchIds: [sharedIdentities.clientBatchId],
+      clientItemIds: [sharedIdentities.clientItemId],
+    });
+    const operatorStatus = outboxStatusResponseSchema.parse(
+      await (
+        await fetch(`${baseUrl}/api/v1/outbox/status`, {
+          method: "POST",
+          headers: { cookie: operatorCookie, "content-type": "application/json" },
+          body: statusBody,
+        })
+      ).json(),
+    );
+    const syntheticStatus = outboxStatusResponseSchema.parse(
+      await (
+        await fetch(`${baseUrl}/api/v1/outbox/status`, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${syntheticToken}`,
+            "content-type": "application/json",
+          },
+          body: statusBody,
+        })
+      ).json(),
+    );
+    expect(operatorStatus.batches[0].id).toBe(operatorCreatedBody.batch.id);
+    expect(syntheticStatus.batches[0].id).toBe(syntheticCreatedBody.batch.id);
+    expect(operatorStatus.batches[0].id).not.toBe(syntheticStatus.batches[0].id);
   });
 });

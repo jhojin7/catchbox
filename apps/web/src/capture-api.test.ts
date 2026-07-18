@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import type { CaptureBatchRequest } from "@catchbox/shared";
-import { CaptureApiError, fetchCaptureInbox, submitTextCapture } from "./capture-api";
+import {
+  CaptureApiError,
+  fetchCaptureInbox,
+  reconcileOutbox,
+  retryOutboxItems,
+  submitTextCapture,
+} from "./capture-api";
 
 const request: CaptureBatchRequest = {
   clientBatchId: "79d34d4b-662f-4d7b-95bc-a2cb509872a8",
@@ -73,5 +79,63 @@ describe("browser capture API", () => {
     await expect(
       fetchCaptureInbox(async () => new Response(JSON.stringify({ rows: [] }), { status: 200 })),
     ).rejects.toThrow("Catchbox returned an invalid response");
+  });
+
+  test("reconciles stable client identities through the authenticated status endpoint", async () => {
+    let requestedUrl = "";
+    let requestedBody: unknown;
+    const result = await reconcileOutbox(
+      {
+        clientBatchIds: [request.clientBatchId],
+        clientItemIds: [request.items[0].clientItemId],
+      },
+      async (url, init) => {
+        requestedUrl = url;
+        requestedBody = JSON.parse(String(init?.body));
+        return new Response(JSON.stringify({ batches: [] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    );
+
+    expect(requestedUrl).toBe("/api/v1/outbox/status");
+    expect(requestedBody).toEqual({
+      clientBatchIds: [request.clientBatchId],
+      clientItemIds: [request.items[0].clientItemId],
+    });
+    expect(result).toEqual({ batches: [] });
+  });
+
+  test("retries only selected stable members through the authenticated outbox endpoint", async () => {
+    let requestedUrl = "";
+    await retryOutboxItems(
+      { batch: request, clientItemIds: [request.items[0].clientItemId] },
+      async (url) => {
+        requestedUrl = url;
+        return new Response(
+          JSON.stringify({
+            batch: {
+              id: "33128080-cf27-4517-a3fa-c8ce1895a8c8",
+              clientBatchId: request.clientBatchId,
+              result: "created",
+              capturedAt: request.capturedAt,
+              receivedAt: "2026-07-18T08:15:31.000Z",
+            },
+            items: [
+              {
+                id: "25b9d4c4-801a-4707-9072-d5920be3c44e",
+                clientItemId: request.items[0].clientItemId,
+                result: "created",
+                type: "text",
+                state: "ready",
+              },
+            ],
+          }),
+          { status: 201, headers: { "content-type": "application/json" } },
+        );
+      },
+    );
+    expect(requestedUrl).toBe("/api/v1/outbox/retry-items");
   });
 });

@@ -34,6 +34,25 @@ async function localSyncStatus(page: Page, clientItemId: string) {
   );
 }
 
+async function localErrorCode(page: Page, clientItemId: string) {
+  return page.evaluate(
+    (id) =>
+      new Promise<string | undefined>((resolve, reject) => {
+        const open = indexedDB.open("catchbox-local-v1");
+        open.onerror = () => reject(open.error);
+        open.onsuccess = () => {
+          const request = open.result.transaction("items").objectStore("items").get(id);
+          request.onerror = () => reject(request.error);
+          request.onsuccess = () => {
+            resolve((request.result as { lastErrorCode?: string } | undefined)?.lastErrorCode);
+            open.result.close();
+          };
+        };
+      }),
+    clientItemId,
+  );
+}
+
 async function localAuthorizedAccountId(page: Page) {
   return page.evaluate(
     () =>
@@ -157,9 +176,129 @@ test("eligible foreground startup drains pending work after a failed submission"
   await page.unroute("**/api/v1/capture-batches");
   await page.reload();
 
+  await expect(
+    page.locator(".capture-item", { hasText: "Recover when foregrounded" }).getByText("Pending"),
+  ).toBeVisible();
   const syncedItem = page.locator(".capture-item", { hasText: "Recover when foregrounded" });
-  await expect(syncedItem.getByText("Synced")).toBeVisible();
+  await expect(syncedItem.getByText("Synced")).toBeVisible({ timeout: 3_000 });
   await expect(syncedItem).toHaveAttribute("data-client-item-id", clientItemId!);
+});
+
+test("a lost response after commit reconciles without a duplicate submission", async ({ page }) => {
+  await signIn(page);
+  let submissions = 0;
+  await page.route("**/api/v1/capture-batches", async (route) => {
+    const body = route.request().postDataJSON() as { items: [{ text: string }] };
+    if (body.items[0].text !== "Commit before losing response") return route.continue();
+    submissions += 1;
+    const committed = await route.fetch();
+    expect(committed.status()).toBe(201);
+    await route.abort("connectionreset");
+  });
+
+  await page.getByLabel("Capture text").fill("Commit before losing response");
+  await page.getByRole("button", { name: "Save capture" }).click();
+  const item = page.locator(".capture-item", { hasText: "Commit before losing response" });
+  await expect(item.getByText("Pending", { exact: true })).toBeVisible();
+  const clientItemId = await item.getAttribute("data-client-item-id");
+  await expect.poll(() => localErrorCode(page, clientItemId!)).toBe("NETWORK_ERROR");
+
+  await page.unroute("**/api/v1/capture-batches");
+
+  await expect(item.getByText("Synced")).toBeVisible({ timeout: 5_000 });
+  await expect(item).toHaveAttribute("data-client-item-id", clientItemId!);
+  expect(submissions).toBe(1);
+  const matches = await page.evaluate(async () => {
+    const response = await fetch("/api/v1/captures");
+    const inbox = (await response.json()) as { captures: Array<{ text: string }> };
+    return inbox.captures.filter((capture) => capture.text === "Commit before losing response")
+      .length;
+  });
+  expect(matches).toBe(1);
+});
+
+test("an unreadable delivered response reconciles the committed capture", async ({ page }) => {
+  await signIn(page);
+  let submissions = 0;
+  await page.route("**/api/v1/capture-batches", async (route) => {
+    const body = route.request().postDataJSON() as { items: [{ text: string }] };
+    if (body.items[0].text !== "Response becomes unreadable") return route.continue();
+    submissions += 1;
+    const committed = await route.fetch();
+    expect(committed.status()).toBe(201);
+    await route.fulfill({ status: 201, contentType: "application/json", body: "{" });
+  });
+
+  await page.getByLabel("Capture text").fill("Response becomes unreadable");
+  await page.getByRole("button", { name: "Save capture" }).click();
+  const item = page.locator(".capture-item", { hasText: "Response becomes unreadable" });
+  await expect(item.getByText("Pending", { exact: true })).toBeVisible();
+  const clientItemId = await item.getAttribute("data-client-item-id");
+
+  await page.unroute("**/api/v1/capture-batches");
+
+  await expect(item.getByText("Synced")).toBeVisible({ timeout: 3_000 });
+  expect(submissions).toBe(1);
+});
+
+test("failed captures support stable manual retry and confirmed local discard", async ({ page }) => {
+  await signIn(page);
+  await page.route("**/api/v1/capture-batches", async (route) => {
+    const body = route.request().postDataJSON() as { items: [{ text: string }] };
+    if (!body.items[0].text.startsWith("Manual ")) return route.continue();
+    await route.fulfill({
+      status: 400,
+      contentType: "application/json",
+      body: JSON.stringify({
+        code: "INVALID_REQUEST",
+        message: "Capture batch request is invalid",
+      }),
+    });
+  });
+
+  await page.getByLabel("Capture text").fill("Manual retry capture");
+  await page.getByRole("button", { name: "Save capture" }).click();
+  const retryItem = page.locator(".capture-item", { hasText: "Manual retry capture" });
+  await expect(retryItem.getByText("Failed", { exact: true })).toBeVisible();
+  await expect(retryItem).toContainText("Catchbox rejected this capture");
+  const retryClientItemId = await retryItem.getAttribute("data-client-item-id");
+
+  await page.unroute("**/api/v1/capture-batches");
+  await retryItem.getByRole("button", { name: "Retry" }).click();
+  await expect(retryItem.getByText("Synced")).toBeVisible();
+  await expect(retryItem).toHaveAttribute("data-client-item-id", retryClientItemId!);
+
+  await page.route("**/api/v1/capture-batches", async (route) => {
+    const committed = await route.fetch();
+    expect(committed.status()).toBe(201);
+    await route.fulfill({
+      status: 400,
+      contentType: "application/json",
+      body: JSON.stringify({
+        code: "INVALID_REQUEST",
+        message: "Capture batch request is invalid",
+      }),
+    });
+  });
+  await page.getByLabel("Capture text").fill("Manual discard committed capture");
+  await page.getByRole("button", { name: "Save capture" }).click();
+  const discardItem = page.locator(".capture-item", {
+    hasText: "Manual discard committed capture",
+  });
+  await expect(discardItem.getByText("Failed", { exact: true })).toBeVisible();
+  page.once("dialog", (dialog) => dialog.accept());
+  await discardItem.getByRole("button", { name: "Discard" }).click();
+  await expect(discardItem).toHaveCount(0);
+  expect(await localCaptureIdByText(page, "Manual discard committed capture")).toBeUndefined();
+  await page.unroute("**/api/v1/capture-batches");
+  const committedMatches = await page.evaluate(async () => {
+    const response = await fetch("/api/v1/captures");
+    const inbox = (await response.json()) as { captures: Array<{ text: string }> };
+    return inbox.captures.filter(
+      (capture) => capture.text === "Manual discard committed capture",
+    ).length;
+  });
+  expect(committedMatches).toBe(1);
 });
 
 test("pending work survives a browser process restart while the shell is offline", async ({}, testInfo) => {
@@ -428,7 +567,7 @@ test("an observed batch 401 revokes offline access even when the inbox is unreac
     "Retain after an observed batch rejection",
   );
   expect(clientItemId).toBeTruthy();
-  expect(await localSyncStatus(page, clientItemId!)).toBe("pending");
+  expect(await localSyncStatus(page, clientItemId!)).toBe("failed");
   expect(await localAuthorizedAccountId(page)).toBeUndefined();
 
   await context.setOffline(true);

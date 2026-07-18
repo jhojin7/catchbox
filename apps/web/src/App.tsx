@@ -10,10 +10,13 @@ import { CaptureApiError, fetchCaptureInbox } from "./capture-api";
 import {
   authorizeOfflineAccount,
   clearOfflineAuthorization,
+  discardFailedCapture,
   drainPendingCaptures,
   listLocalCaptures,
   loadOfflineAuthorizedAccount,
+  nextPendingCaptureAttempt,
   OUTBOX_SYNC_TAG,
+  retryFailedCapture,
   savePendingTextCapture,
   type LocalCaptureItem,
 } from "./local-captures";
@@ -158,9 +161,12 @@ function ProtectedShell({
   const [error, setError] = useState<string>();
   const [offline, setOffline] = useState(!navigator.onLine);
   const [signingOut, setSigningOut] = useState(false);
+  const [recoveringItemId, setRecoveringItemId] = useState<string>();
+  const [syncGeneration, setSyncGeneration] = useState(0);
 
   useEffect(() => {
     let active = true;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
     async function refreshAndDrain() {
       const result = await synchronizeCaptures(account.id);
       if (!active) return;
@@ -172,17 +178,30 @@ function ProtectedShell({
       setOffline(result.offline);
       setError(undefined);
       setLoading(false);
+      const nextAttemptAt = await nextPendingCaptureAttempt(account.id);
+      if (active && nextAttemptAt) {
+        clearTimeout(retryTimer);
+        retryTimer = setTimeout(
+          () => void refreshAndDrain(),
+          Math.max(0, new Date(nextAttemptAt).getTime() - Date.now()) + 10,
+        );
+      }
     }
 
     void listLocalCaptures(account.id).then((local) => {
       if (active) setCaptures(mergeCaptures(local, []));
     });
     void refreshAndDrain();
-    window.addEventListener("online", refreshAndDrain);
     return () => {
       active = false;
-      window.removeEventListener("online", refreshAndDrain);
+      clearTimeout(retryTimer);
     };
+  }, [account.id, syncGeneration]);
+
+  useEffect(() => {
+    const requestSynchronization = () => setSyncGeneration((generation) => generation + 1);
+    window.addEventListener("online", requestSynchronization);
+    return () => window.removeEventListener("online", requestSynchronization);
   }, [account.id]);
 
   async function capture(event: FormEvent) {
@@ -202,14 +221,7 @@ function ProtectedShell({
       setText("");
       setNotice("Capture saved locally");
       void requestBackgroundSync();
-      void synchronizeCaptures(account.id).then((result) => {
-        if (result.status === "authentication-required") {
-          void onSignedOut();
-          return;
-        }
-        setOffline(result.offline);
-        setCaptures(result.captures);
-      });
+      setSyncGeneration((generation) => generation + 1);
     } catch {
       setError("The capture could not be saved on this device.");
     } finally {
@@ -233,6 +245,37 @@ function ProtectedShell({
       }
       setError("Catchbox could not sign out. Check the server and try again.");
       setSigningOut(false);
+    }
+  }
+
+  async function retryCapture(clientItemId: string) {
+    setRecoveringItemId(clientItemId);
+    try {
+      if (!(await retryFailedCapture(account.id, clientItemId))) return;
+      setCaptures((current) =>
+        current.map((capture) =>
+          capture.clientItemId === clientItemId
+            ? { ...capture, syncStatus: "pending" }
+            : capture,
+        ),
+      );
+      setSyncGeneration((generation) => generation + 1);
+    } finally {
+      setRecoveringItemId(undefined);
+    }
+  }
+
+  async function discardCapture(clientItemId: string) {
+    if (!window.confirm("Discard this failed local capture? This cannot be undone.")) return;
+    setRecoveringItemId(clientItemId);
+    try {
+      if (await discardFailedCapture(account.id, clientItemId)) {
+        setCaptures((current) =>
+          current.filter((capture) => capture.clientItemId !== clientItemId),
+        );
+      }
+    } finally {
+      setRecoveringItemId(undefined);
     }
   }
 
@@ -302,12 +345,38 @@ function ProtectedShell({
                   <p>{item.text}</p>
                   <div className="capture-meta">
                     <span className={`sync-status ${item.syncStatus}`} aria-live="polite">
-                      {item.syncStatus === "pending" ? "Pending" : "Synced"}
+                      {item.syncStatus === "pending"
+                        ? "Pending"
+                        : item.syncStatus === "failed"
+                          ? "Failed"
+                          : "Synced"}
                     </span>
                     <time dateTime={item.receivedAt ?? item.capturedAt}>
                       {new Date(item.receivedAt ?? item.capturedAt).toLocaleString()}
                     </time>
                   </div>
+                  {item.syncStatus === "failed" && (
+                    <div className="outbox-recovery">
+                      <p className="outbox-error">{item.lastErrorDetail}</p>
+                      <div className="outbox-actions">
+                        <button
+                          type="button"
+                          onClick={() => void retryCapture(item.clientItemId)}
+                          disabled={recoveringItemId === item.clientItemId}
+                        >
+                          Retry
+                        </button>
+                        <button
+                          type="button"
+                          className="danger-secondary"
+                          onClick={() => void discardCapture(item.clientItemId)}
+                          disabled={recoveringItemId === item.clientItemId}
+                        >
+                          Discard
+                        </button>
+                      </div>
+                    </div>
+                  )}
                 </li>
               ))}
             </ol>
@@ -324,6 +393,8 @@ interface VisibleCapture {
   syncStatus: LocalCaptureItem["syncStatus"];
   capturedAt: string;
   receivedAt?: string;
+  lastErrorCode?: LocalCaptureItem["lastErrorCode"];
+  lastErrorDetail?: string;
 }
 
 async function synchronizeCaptures(accountId: string) {
