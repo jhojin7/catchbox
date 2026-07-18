@@ -34,3 +34,17 @@ Before calling a change complete, run the relevant type checks, unit/integration
 ## Scope discipline
 
 Do not add collaboration, public internet exposure, Postgres support, S3 storage, semantic search, OCR, reminders, or full note-editor parity unless the user explicitly brings that feature into scope. When a choice is not covered by `PLAN.md`, prefer the smallest reversible design and record the assumption.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and PRDs are tracked in GitHub Issues for `jhojin7/catchbox`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the default five-role triage vocabulary. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Use the single-context domain documentation layout. See `docs/agents/domain.md`.
